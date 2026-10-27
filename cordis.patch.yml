@@ -1,0 +1,222 @@
+# 互联网暴露面收集 —— bundle 补丁。
+#
+# 两份声明，都靠 `dsh.bundle.patch` 挂上来：
+#   1. `infohunter`        Host 半：自带 SQLite 后端 + store + 面板 HTTP 接口（index.js）
+#   2. `preset-information-hunter`  agent 预设：standard 形态的组合 + 本插件的 preset 半
+#
+# 两条硬约束，都是踩过的坑：
+#
+# ⚠️【1】`infohunter` 这一行的 `name` 必须是**包根名**。DSH 按包根定位客户端半
+#   （`exports["./client"]`），写子路径会让整个客户端 bundle 静默不下发 ——
+#   面板永远不出现，而宿主侧零报错。
+#
+# ⚠️【2】预设里的每一行都必须是**这套构建真的装了**的包，且**必需 config 键一个都不能少**。
+#   写错名字或缺必需键的后果是静默的：mountPreset 挂不上 → 预设被标 broken →
+#   而新会话的预设选择器**会过滤掉 broken 的预设**，于是用户看到「这个预设不存在」，
+#   宿主日志/浏览器控制台/构建输出都没有红字。
+#
+#   所以下面每一行都**逐字取自这套构建自带的 `standard` 预设**
+#   （`@deepseek-ai/dsh-web-app/presets/standard.patch.yml`），只改了 persona 文案、
+#   去掉了与侦察无关的两行（tool-schedule、tool-plugin-manager/market 的 disabled 占位），
+#   并加了本插件的 preset 半。**加新行前先跑 `node scripts/check-modules.mjs`。**
+#
+#   已核实为**必需**的 config 键（缺了激活就失败）：
+#     · dsh-persona.prefix
+#     · dsh-agent-instructions.maxBytes
+#     · dsh-tool-fs-search.sampleOverCapGlobResults
+#     · dsh-tool-todo.allowParallelInProgress
+#   `dsh-compaction-tool-result-pruner` 对未知键是硬报错（有显式白名单），且要求
+#   `headChars + 标记 + tailChars ≤ thresholdChars`。
+
+- insert:
+    # ── 1. Host 半（包根名，见 ⚠️【1】）──────────────────────────────────
+    - id: infohunter
+      name: '@infohunter/dsh-information-hunter'
+      # 可选：覆盖数据库位置。相对路径按 $DSH_HOME 解析，缺省 storages/infohunter.db。
+      # config:
+      #   database: storages/infohunter.db
+
+    # ── 2. agent 预设 ─────────────────────────────────────────────────────
+    - id: preset-information-hunter
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: information-hunter
+        name: 互联网暴露面收集
+        description: 渗透测试「暴露面收集」专项：主域名/子域名/DNS/端口/服务/Web/指纹/CDN 逐层收集，工具与空间测绘平台在面板里配置（SQLite 全局持久化），结果实时上板。
+        order: 210
+        plugins:
+          # ── 身份 ────────────────────────────────────────────────────────
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              # `{{model}}` 由 standard 预设证实可用；`{{cwd}}` 没证实，不写。
+              prefix: |-
+                你是「互联网暴露面收集」专员，运行在 DeepSeek Harness 上，由 {{model}} 模型驱动。与用户交互一律中文。
+
+                你只做一件事：把目标在互联网上的暴露面尽可能完整、可复核地收集下来，写成结构化结果。
+                你不做漏洞验证、不做利用、不做注入 —— 那是下游阶段的事。越界不是「多做了」，而是做错了。
+
+                开工第一件事是调 expose_config，看清可用的工具与空间测绘平台（含用法说明）。
+                配置为空就如实说明 —— 本会话没有 shell、没有文件工具、也没有任意 URL 抓取，
+                所以没有配置就真的没有手段，不要假装有。
+
+                面板「配置」就是这个 agent 的**能力边界**：里面没有的工具跑不了、平台查不了 ——
+                这一点由代码保证（执行只能走 expose_tool_run，且只认配置里的工具）。
+                缺什么就让用户去面板加一行，不要想办法绕。
+
+                **目标不需要预先登记。** 你要产出的就是范围本身：从一个用户给的起点（域名/IP/组织名）
+                往外扩，把发现的资产如实记进结果表。不要反过来要求用户先给一份完整清单。
+
+                边收集边用 expose_record 记录 —— 面板的「采集记录」与「资产清单」实时读的就是它，不要攒到最后。
+                一次调用写两处：记录是一行一条的过程流水，资产清单按 host:port 汇总（同端点自动合并）。
+                **asset 写端点是关键**：`1.2.3.4:8080`、`api.example.com:443` 才会进资产清单，纯域名算 host 级。
+                只填测到的字段，没测就留空；只记实际观察到的事实，推断的标低置信度并写明推理链。
+                识别泛解析、CDN 回源、WAF 拦截页这类「看起来一样」的假结果，别把一批同质噪声当成发现。
+
+                大范围目标可以扇出：用 subagent 按子域/网段分工，或用 workflow 对几十个目标做同构探测；
+                但每一个子任务的结论都要回到你自己的结果表里，别让结论散在子代理的上下文里。
+
+                收尾给一份简短汇总：覆盖了哪几层、每层多少条、哪些层缺以及为什么缺、下一步建议。
+                不要复述全部条目 —— 它们在面板里。分层方法论见 info-hunter-method 技能。
+
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+
+          # 当前时间/时区。侦察里这不是装饰：证书有效期、CT 时间窗、扫描耗时都要对时。
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+          # ── 刻意不给的能力：shell / 文件 / 任意抓取 ───────────────────────
+          #
+          # 这里**故意没有** tool-bash、tool-pwsh、tool-fs、tool-fs-search、tool-jobs，
+          # 下面的 tool-web 也关掉了 fetch。
+          #
+          # 原因是一条实测教训：给了 pwsh 之后，"面板配置是授权边界"这句话立刻失效 ——
+          # 模型顺手就能扫 PATH、递归遍历磁盘上的工具库、执行没配置的二进制（fscan、whatweb…）、
+          # 连任意外部地址。而"只测授权范围"当时只写在章程里，是口头约束，拦不住。
+          #
+          # 去掉这些之后，这个 agent 能做的事只剩本插件自己的工具：
+          #   · expose_tool_run —— 只执行面板配置里的工具，argv 方式（不过 shell），目标必须在授权范围内
+          #   · expose_mapping_call —— 只打配置里的平台，查询里出现范围外目标就拒绝
+          #   · expose_run_query —— 在保存的 run 输出里检索，代替 grep
+          #   · web_search —— 搜索引擎查询，不接触任意外部主机
+          # 于是"越界"在结构上就没有出口，不需要靠任何提示词。
+
+          # ── 技能 ────────────────────────────────────────────────────────
+          # 本包的 info-hunter-method 技能由 preset 半在运行期读包内 SKILL.md 注册
+          # （声明式预设行拿不到包目录，`customSkillDirs` 会静默指错地方）。
+          # 保留 skill-filesystem 是为了让用户自己的技能目录也被发现。
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+
+          # ── goal（多阶段长任务的承载）──────────────────────────────────
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+
+          # ── plan mode（第一道关就是「授权范围」，先出计划再动手）─────────
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement means plan it, not execute it. A user's conversational agreement approves nothing.
+
+                    Explore first with non-mutating reads, searches and lookups. Do not start active scanning, brute forcing, exploitation, or any request that changes state on a target while in plan mode. Passive lookups (public data, search engines, certificate transparency) are fine.
+
+                    The plan must state the authorized scope explicitly: which root domains, IP ranges and organisations are in scope, and which discovered assets would fall outside it. Include the collection layers you intend to cover, the tools and cyberspace-mapping platforms you will use (from expose_config), the rate limits and concurrency you will keep, and how you will record and verify findings.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response. Do not paste the plan as a plain reply.
+
+          # ── compaction（原始扫描输出是最该被剪掉的东西）─────────────────
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+          # ── 扇出：子代理与 workflow（逐字取自 standard，provider 已证实可用）──
+          # 暴露面收集天然可并行：一个子域一个子代理、几十个目标一个 workflow。
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+
+          # ── 交互与产出 ─────────────────────────────────────────────────
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              # 只留 search：`fetch` 关掉，就没有"抓任意 URL"这条逃逸口。
+              # 公开情报仍可用 web_search；需要抓具体页面时，把那个数据源配成一行空间测绘。
+              fetch: false
+              search: true
+              searchTimeoutMs: 60000
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+
+          # ── 本插件（preset 半）：expose_* 工具 + 常驻段 + 技能 ──────────
+          - id: infohunter-preset
+            name: '@infohunter/dsh-information-hunter/preset'

@@ -1,0 +1,12 @@
+# 依赖（本包零运行时依赖，只有开发期可能临时装东西）
+node_modules/
+
+# 打包产物
+*.tgz
+dist/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

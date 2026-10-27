@@ -1,0 +1,48 @@
+{
+  "name": "@infohunter/dsh-information-hunter",
+  "version": "0.6.4",
+  "private": true,
+  "type": "module",
+  "description": "互联网暴露面收集：暴露面收集 agent 预设 + 会话面板 + SQLite 持久化的工具/空间测绘配置。",
+  "exports": {
+    ".": "./index.js",
+    "./preset": "./preset.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "preset.js",
+    "storage.js",
+    "vocabulary.js",
+    "assets.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "skills/*/SKILL.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "scripts": {
+    "check": "node scripts/check-modules.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:client": "node scripts/smoke-client.mjs",
+    "test": "node scripts/check-modules.mjs && node scripts/smoke.mjs && node scripts/smoke-client.mjs",
+    "pack:dist": "node scripts/pack-dist.mjs"
+  },
+  "license": "MIT"
+}

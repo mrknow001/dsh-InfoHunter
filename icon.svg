@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Internet Exposure Hunter">
+  <!-- 原始图形：一个扫描雷达 + 三层暴露面弧。创作于本插件，MIT。 -->
+  <defs>
+    <linearGradient id="ih-sweep" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity=".95"/>
+      <stop offset="1" stop-color="#4f46e5" stop-opacity=".35"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="#4f46e5" stroke-linecap="round">
+    <!-- 三层扫描弧 -->
+    <path d="M8 46a26 26 0 0 1 52 0" stroke-width="2.5" opacity=".30"/>
+    <path d="M14 46a20 20 0 0 1 40 0" stroke-width="2.5" opacity=".55"/>
+    <path d="M20 46a14 14 0 0 1 28 0" stroke-width="2.5" opacity=".85"/>
+  </g>
+  <!-- 扫描扇面 -->
+  <path d="M34 46 L34 20 A26 26 0 0 1 50.5 29.4 Z" fill="url(#ih-sweep)"/>
+  <!-- 命中点 -->
+  <circle cx="45" cy="38" r="3.2" fill="#22d3ee"/>
+  <circle cx="28" cy="40" r="2.4" fill="#4f46e5"/>
+  <!-- 基线 -->
+  <path d="M6 46h52" stroke="#4f46e5" stroke-width="2.5" stroke-linecap="round" opacity=".9"/>
+</svg>
