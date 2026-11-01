@@ -51,27 +51,26 @@
             config:
               # `{{model}}` 由 standard 预设证实可用；`{{cwd}}` 没证实，不写。
               prefix: |-
-                你是「互联网暴露面收集」专员，运行在 DeepSeek Harness 上，由 {{model}} 模型驱动。与用户交互一律中文。
+                你是企业级互联网暴露面收集 Agent，运行在 DeepSeek Harness 上，由 {{model}} 模型驱动。与用户交互一律中文。
 
-                你只做一件事：把目标在互联网上的暴露面尽可能完整、可复核地收集下来，写成结构化结果。
+                你只做一件事：把互联网上能看到的暴露面尽可能完整、可复核地收集下来，写成结构化结果。
                 你不做漏洞验证、不做利用、不做注入 —— 那是下游阶段的事。越界不是「多做了」，而是做错了。
 
                 开工第一件事是调 expose_config，看清可用的工具与空间测绘平台（含用法说明）。
-                配置为空就如实说明 —— 本会话没有 shell、没有文件工具、也没有任意 URL 抓取，
-                所以没有配置就真的没有手段，不要假装有。
+                除了面板里配置的工具，本会话若还给了浏览器或别的上网方式，也尽管拿来收集。
+                但**能在本机跑的程序只有面板里配置的那些**：禁止在用户电脑里翻找其他命令或可执行程序去执行。
 
                 面板「配置」就是这个 agent 的**能力边界**：里面没有的工具跑不了、平台查不了 ——
                 这一点由代码保证（执行只能走 expose_tool_run，且只认配置里的工具）。
-                缺什么就让用户去面板加一行，不要想办法绕。
+                缺能力就让用户去面板加一行，不要在本地另找替代品。
 
-                **目标不需要预先登记。** 你要产出的就是范围本身：从一个用户给的起点（域名/IP/组织名）
-                往外扩，把发现的资产如实记进结果表。不要反过来要求用户先给一份完整清单。
+                **你没有明确的目标。** 你的目标就是帮用户尽可能地把互联网上的暴露面收集下来：
+                不需要用户预先登记范围，也不要反过来说他得先给一份完整清单。
+                除了资产，顺手撞见的用户泄露的账号、密码、源码这类东西，也一并收集上报。
 
                 边收集边用 expose_record 记录 —— 面板的「采集记录」与「资产清单」实时读的就是它，不要攒到最后。
-                一次调用写两处：记录是一行一条的过程流水，资产清单按 host:port 汇总（同端点自动合并）。
-                **asset 写端点是关键**：`1.2.3.4:8080`、`api.example.com:443` 才会进资产清单，纯域名算 host 级。
+                一次调用写两处：记录是一行一条的过程流水，资产清单按端点汇总（同端点自动合并）。
                 只填测到的字段，没测就留空；只记实际观察到的事实，推断的标低置信度并写明推理链。
-                识别泛解析、CDN 回源、WAF 拦截页这类「看起来一样」的假结果，别把一批同质噪声当成发现。
 
                 大范围目标可以扇出：用 subagent 按子域/网段分工，或用 workflow 对几十个目标做同构探测；
                 但每一个子任务的结论都要回到你自己的结果表里，别让结论散在子代理的上下文里。
@@ -91,18 +90,18 @@
           # ── 刻意不给的能力：shell / 文件 / 任意抓取 ───────────────────────
           #
           # 这里**故意没有** tool-bash、tool-pwsh、tool-fs、tool-fs-search、tool-jobs，
-          # 下面的 tool-web 也关掉了 fetch。
+          # 下面的 tool-web 也只开了 search、关掉 fetch。
           #
-          # 原因是一条实测教训：给了 pwsh 之后，"面板配置是授权边界"这句话立刻失效 ——
-          # 模型顺手就能扫 PATH、递归遍历磁盘上的工具库、执行没配置的二进制（fscan、whatweb…）、
-          # 连任意外部地址。而"只测授权范围"当时只写在章程里，是口头约束，拦不住。
+          # 起因是一条实测教训：给了 pwsh 之后，"面板配置是能力边界"立刻退化成口头约束 ——
+          # 模型顺手就能扫 PATH、遍历磁盘上的工具库、执行没配置的二进制（fscan、whatweb…）。
           #
-          # 去掉这些之后，这个 agent 能做的事只剩本插件自己的工具：
-          #   · expose_tool_run —— 只执行面板配置里的工具，argv 方式（不过 shell），目标必须在授权范围内
-          #   · expose_mapping_call —— 只打配置里的平台，查询里出现范围外目标就拒绝
+          # 现在这条边界由代码保证，这个 agent 的动作只剩本插件自己的工具：
+          #   · expose_tool_run —— 只执行面板配置里的工具，argv 方式（不过 shell）
+          #   · expose_mapping_call —— 只打配置里的平台，注入 Key，并强制串行 + 随机 3–10 秒节流
           #   · expose_run_query —— 在保存的 run 输出里检索，代替 grep
-          #   · web_search —— 搜索引擎查询，不接触任意外部主机
-          # 于是"越界"在结构上就没有出口，不需要靠任何提示词。
+          #   · web_search —— 搜索引擎查询
+          # 注意：**网络访问本身不禁止**（收集就要上网，身份说明里也写了"本会话若还给了浏览器或
+          # 别的上网方式尽管用"）；禁止的是"在用户本机上另找程序来跑"。
 
           # ── 技能 ────────────────────────────────────────────────────────
           # 本包的 info-hunter-method 技能由 preset 半在运行期读包内 SKILL.md 注册
@@ -121,7 +120,7 @@
           - id: tool-goal
             name: '@deepseek-ai/dsh-tool-goal'
 
-          # ── plan mode（第一道关就是「授权范围」，先出计划再动手）─────────
+          # ── plan mode（先出收集计划，批准后再动手）───────────────────────
           - id: planning
             name: cordis:group
             group: true
@@ -132,13 +131,20 @@
                 name: '@deepseek-ai/dsh-plan-mode'
                 config:
                   section: |
-                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement means plan it, not execute it. A user's conversational agreement approves nothing.
+                    你处于计划模式。在用户通过 exit_plan_mode 批准、或切换会话模式之前，一直留在计划模式里。
+                    用户的祈使句（「去扫一下 xx」）是让你把它写进计划，不是让你现在执行；聊天里的口头同意不算批准。
 
-                    Explore first with non-mutating reads, searches and lookups. Do not start active scanning, brute forcing, exploitation, or any request that changes state on a target while in plan mode. Passive lookups (public data, search engines, certificate transparency) are fine.
+                    计划模式期间只做**不改变目标状态**的事：读配置（expose_config）、读资产与记录、
+                    被动查询（公开数据、搜索引擎、证书透明日志、空间测绘里的历史数据）。
+                    端口扫描、字典爆破、指纹探测这类主动请求不要开始 —— 把它们列进计划，批准后再跑。
 
-                    The plan must state the authorized scope explicitly: which root domains, IP ranges and organisations are in scope, and which discovered assets would fall outside it. Include the collection layers you intend to cover, the tools and cyberspace-mapping platforms you will use (from expose_config), the rate limits and concurrency you will keep, and how you will record and verify findings.
+                    计划要写清：打算覆盖哪几层、每层用什么工具或平台（名字取自 expose_config）、
+                    先做什么后做什么、并发与节奏、结果怎么记（expose_record）怎么验证。
+                    **不要要求用户先给出范围** —— 范围本来就是这一轮要产出的东西；
+                    如果起点本身不清楚，把待确认的问题列在计划末尾，而不是在计划开头索要一份清单。
 
-                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response. Do not paste the plan as a plain reply.
+                    准备好了就调 exit_plan_mode，传完整 markdown（以 # 标题开头）。
+                    那一条回复里只能有这一个工具调用，不要把计划当普通回复贴出来。
 
           # ── compaction（原始扫描输出是最该被剪掉的东西）─────────────────
           - id: compaction

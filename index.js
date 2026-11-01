@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import { HunterStore, SqliteKvBackend, BACKEND_NAME, UNIT_NAME, UNIT_VERSION } from './storage.js'
+import { SKILL_LIMITS, assertRowId, defaultSkillsRoot, installSkillZip, pruneSkillDirs } from './skillpack.js'
 
 /**
  * 本包清单与版本。
@@ -72,7 +73,7 @@ export const inject = ['storage']
 const ROUTE_PREFIX = '/infohunter'
 
 /** 面板读写的表名（unit 内）。 */
-const TABLES = ['config', 'results', 'assets']
+const TABLES = ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links']
 
 /** 单个请求体的上限，防止误传巨大 JSON。 */
 const MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -99,6 +100,34 @@ function dshHome() {
   const fromEnv = process.env.DSH_HOME
   if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
   return join(homedir(), '.dsh')
+}
+
+/**
+ * 用户上传的技能落地根目录（实现在 skillpack 里，preset 半读的是同一处）。
+ *
+ * @returns {string} 绝对路径。
+ */
+export function skillsDir() {
+  return defaultSkillsRoot()
+}
+
+/**
+ * 读一个请求的原始二进制体。
+ *
+ * @param {import('node:http').IncomingMessage} req - 请求。
+ * @param {number} maxBytes - 上限。
+ * @returns {Promise<Buffer>}
+ */
+async function readRawBody(req, maxBytes) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > maxBytes) throw new Error(`请求体超过 ${maxBytes} 字节`)
+    chunks.push(chunk)
+  }
+  if (chunks.length === 0) throw new Error('请求体为空（没有收到 zip）')
+  return Buffer.concat(chunks)
 }
 
 /**
@@ -182,32 +211,154 @@ function createApiHandler(getStore) {
       if (endpoint === '/config' && method === 'POST') {
         const body = await readJsonBody(req)
         const entries = body !== null && typeof body === 'object' ? body.entries : undefined
-        return sendJson(res, 200, { config: await store.saveConfig(entries) })
+        const config = await store.saveConfig(entries)
+        // 配置是这堆技能目录的唯一引用来源：行没了，目录也得没。
+        // 面板允许"放弃修改"，所以上传过但没保存的行会在这里被回收。
+        const keep = new Set(config.entries.filter((entry) => entry.type === 'skill').map((entry) => entry.id))
+        await pruneSkillDirs(skillsDir(), keep).catch(() => [])
+        return sendJson(res, 200, { config })
+      }
+
+      // ── 技能包上传（按行 id 落地，覆盖即更新）───────────────────────────
+      if (endpoint === '/skills/upload' && method === 'POST') {
+        const rowId = assertRowId(url.searchParams.get('id'))
+        const archive = await readRawBody(req, SKILL_LIMITS.archive)
+        const meta = await installSkillZip(archive, skillsDir(), rowId)
+        return sendJson(res, 200, { ok: true, ...meta, uploadedAt: new Date().toISOString() })
       }
 
       // ── 资产（按会话） ────────────────────────────────────────────────
+      //
+      // 只读。**资产与采集记录都不提供删除/清空端点**：收集到的东西是证据，
+      // 面板上能删就意味着证据可以被悄悄改掉。要重来就让用户开新会话。
       if (endpoint === '/assets' && method === 'GET') {
         if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
         const page = store.pageAssets(sessionId, {
           q: url.searchParams.get('q') ?? '',
           category: url.searchParams.get('category') ?? '',
+          nodeType: url.searchParams.get('nodeType') ?? '',
+          facet: url.searchParams.get('facet') ?? '',
           offset: url.searchParams.get('offset') ?? '0',
           limit: url.searchParams.get('limit') ?? '',
         })
-        return sendJson(res, 200, { page, overview: store.overviewAssets(sessionId), rev: store.rev(sessionId) })
+        // 计划与覆盖度顺带带出去：面板进度条跟资产同一次请求刷新，不多一个轮询。
+        return sendJson(res, 200, {
+          page,
+          overview: store.overviewAssets(sessionId),
+          plan: store.plan(sessionId),
+          coverage: store.coverage(sessionId),
+          rev: store.rev(sessionId),
+        })
       }
-      if (endpoint === '/assets/drop' && method === 'POST') {
-        const body = (await readJsonBody(req)) ?? {}
-        if (sessionId === '' || typeof body.key !== 'string') {
-          return sendJson(res, 400, { error: { code: 'bad-request', message: '需要 sessionId 与 key' } })
-        }
-        const removed = await store.deleteAsset(sessionId, body.key)
-        return sendJson(res, 200, { removed, rev: store.rev(sessionId) })
-      }
-      if (endpoint === '/assets/clear' && method === 'POST') {
+
+      // ── 问题池（按会话）─────────────────────────────────────────────
+      //
+      // 判定不了的系统对（只命中一项信号）放这里，任务收尾时由 agent 统一问，
+      // 或者用户在面板上直接裁决。
+      if (endpoint === '/questions' && method === 'GET') {
         if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
-        const removed = await store.clearAssets(sessionId)
-        return sendJson(res, 200, { removed, rev: store.rev(sessionId) })
+        const status = url.searchParams.get('status') ?? 'open'
+        return sendJson(res, 200, { questions: store.questionsOf(sessionId, status), rev: store.rev(sessionId) })
+      }
+      if (endpoint === '/questions/resolve' && method === 'POST') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const body = await readJsonBody(req)
+        const id = body !== null && typeof body === 'object' ? body.id : undefined
+        const choice = body !== null && typeof body === 'object' ? body.choice : undefined
+        if (typeof id !== 'string' || id === '') {
+          return sendJson(res, 400, { error: { code: 'bad-request', message: 'id 必填' } })
+        }
+        const resolved = await store.resolveQuestion(sessionId, id, choice, 'user')
+        if (resolved === undefined) {
+          return sendJson(res, 404, { error: { code: 'not-found', message: '问题不存在或 choice 非法' } })
+        }
+        return sendJson(res, 200, { question: resolved, rev: store.rev(sessionId) })
+      }
+
+      // ── 系统合并 / 拆分（人工调整，可逆）─────────────────────────────
+      if (endpoint === '/apps/merge' && method === 'POST') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const body = await readJsonBody(req)
+        const parent = body !== null && typeof body === 'object' ? body.parent : undefined
+        const child = body !== null && typeof body === 'object' ? body.child : undefined
+        if (typeof parent !== 'string' || typeof child !== 'string' || parent === '' || child === '') {
+          return sendJson(res, 400, { error: { code: 'bad-request', message: 'parent 与 child 必填' } })
+        }
+        const merged = await store.mergeApps(sessionId, parent, child)
+        if (merged === undefined) {
+          return sendJson(res, 404, { error: { code: 'not-found', message: '找不到这两个系统节点' } })
+        }
+        return sendJson(res, 200, { app: merged, rev: store.rev(sessionId) })
+      }
+      if (endpoint === '/apps/split' && method === 'POST') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const body = await readJsonBody(req)
+        const key = body !== null && typeof body === 'object' ? body.key : undefined
+        if (typeof key !== 'string' || key === '') {
+          return sendJson(res, 400, { error: { code: 'bad-request', message: 'key 必填' } })
+        }
+        const ok = await store.splitApp(sessionId, key)
+        return sendJson(res, 200, { ok, rev: store.rev(sessionId) })
+      }
+
+      // ── 关联域名/IP（按会话，从已有资产与记录算）─────────────────────
+      if (endpoint === '/assets/relations' && method === 'GET') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const key = url.searchParams.get('key') ?? ''
+        if (key === '') return sendJson(res, 400, { error: { code: 'bad-request', message: 'key 必填' } })
+        return sendJson(res, 200, { relations: store.relationsOf(sessionId, key) })
+      }
+
+      // ── 最近使用的过滤语句（全局，不分会话）───────────────────────────
+      //
+      // 这是面板偏好而不是证据：所以**允许**删除与清空，和资产/记录的只读语义无关。
+      if (endpoint === '/queries' && method === 'GET') {
+        return sendJson(res, 200, { queries: store.recentQueries() })
+      }
+      if (endpoint === '/queries' && method === 'POST') {
+        const body = await readJsonBody(req)
+        const q = body !== null && typeof body === 'object' ? body.q : undefined
+        return sendJson(res, 200, { queries: await store.recordQuery(q) })
+      }
+      if (endpoint === '/queries/drop' && method === 'POST') {
+        const body = await readJsonBody(req)
+        const q = body !== null && typeof body === 'object' ? body.q : undefined
+        return sendJson(res, 200, { queries: await store.forgetQuery(q) })
+      }
+      if (endpoint === '/queries/clear' && method === 'POST') {
+        return sendJson(res, 200, { queries: await store.clearQueries() })
+      }
+
+      // ── 信息产物（按会话）─────────────────────────────────────────────
+      //
+      // 只读列表 + 重扫。产物是证据，同样**不提供删除端点**。
+      if (endpoint === '/artifacts' && method === 'GET') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const page = store.pageArtifacts(sessionId, {
+          kind: url.searchParams.get('kind') ?? '',
+          q: url.searchParams.get('q') ?? '',
+          severity: url.searchParams.get('severity') ?? '',
+          offset: url.searchParams.get('offset') ?? '0',
+          limit: url.searchParams.get('limit') ?? '',
+        })
+        return sendJson(res, 200, { page, overview: store.overviewArtifacts(sessionId), rev: store.rev(sessionId) })
+      }
+      if (endpoint === '/artifacts/rescan' && method === 'POST') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const updated = await store.rescanArtifacts(sessionId)
+        return sendJson(res, 200, { updated, rev: store.rev(sessionId) })
+      }
+
+      // ── 设置（全局，section 化，未知 section 原样保留）────────────────
+      if (endpoint === '/settings' && method === 'GET') {
+        return sendJson(res, 200, { settings: store.settings() })
+      }
+      if (endpoint === '/settings' && method === 'POST') {
+        const body = await readJsonBody(req)
+        const section = body !== null && typeof body === 'object' ? body.section : undefined
+        const value = body !== null && typeof body === 'object' ? body.value : undefined
+        const settings = await store.saveSettings(section, value)
+        return sendJson(res, 200, { settings })
       }
 
       // ── 采集记录（按会话，一行一次观测）──────────────────────────────
@@ -221,19 +372,6 @@ function createApiHandler(getStore) {
           limit: url.searchParams.get('limit') ?? '',
         })
         return sendJson(res, 200, { page, overview: store.overviewRecords(sessionId), rev: store.rev(sessionId) })
-      }
-      if (endpoint === '/records/drop' && method === 'POST') {
-        const body = (await readJsonBody(req)) ?? {}
-        if (sessionId === '' || typeof body.id !== 'string') {
-          return sendJson(res, 400, { error: { code: 'bad-request', message: '需要 sessionId 与 id' } })
-        }
-        const removed = await store.deleteRecord(sessionId, body.id)
-        return sendJson(res, 200, { removed, rev: store.rev(sessionId) })
-      }
-      if (endpoint === '/records/clear' && method === 'POST') {
-        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
-        const removed = await store.clearRecords(sessionId)
-        return sendJson(res, 200, { removed, rev: store.rev(sessionId) })
       }
 
       return sendJson(res, 404, { error: { code: 'not-found', message: `未知端点 ${method} ${endpoint}` } })

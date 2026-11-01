@@ -1,9 +1,9 @@
 {
   "name": "@infohunter/dsh-information-hunter",
-  "version": "0.6.4",
+  "version": "0.15.1",
   "private": true,
   "type": "module",
-  "description": "互联网暴露面收集：暴露面收集 agent 预设 + 会话面板 + SQLite 持久化的工具/空间测绘配置。",
+  "description": "互联网暴露面收集：暴露面收集 agent 预设 + 会话面板 + SQLite 持久化的工具/空间测绘/技能/MCP 配置。",
   "exports": {
     ".": "./index.js",
     "./preset": "./preset.js",
@@ -19,6 +19,13 @@
     "storage.js",
     "vocabulary.js",
     "assets.js",
+    "system.js",
+    "artifacts.js",
+    "coverage.js",
+    "plan.js",
+    "skillpack.js",
+    "fetch.js",
+    "mcp.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -37,12 +44,12 @@
       ]
     }
   },
+  "license": "MIT",
   "scripts": {
     "check": "node scripts/check-modules.mjs",
     "smoke": "node scripts/smoke.mjs",
     "smoke:client": "node scripts/smoke-client.mjs",
     "test": "node scripts/check-modules.mjs && node scripts/smoke.mjs && node scripts/smoke-client.mjs",
     "pack:dist": "node scripts/pack-dist.mjs"
-  },
-  "license": "MIT"
+  }
 }
