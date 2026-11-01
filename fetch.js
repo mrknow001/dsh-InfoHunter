@@ -22,6 +22,7 @@
 
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
+import { connect } from 'node:net'
 import { promises as dns } from 'node:dns'
 
 /** 正文最多读这么多字节（面板上限 8000 字符，留点余量给多字节字符）。 */
@@ -149,6 +150,45 @@ export function extractText(html) {
   const withoutHead = source.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
   const text = withoutHead.replace(/<[^>]+>/g, ' ')
   return text.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim().slice(0, 8000)
+}
+
+/**
+ * TCP 连通性探测：只握手，不发数据。
+ *
+ * 空间测绘的结果经常是几个月前的，端口早就关了 —— 这一层用来确认"现在还开着吗"。
+ *
+ * @param input - `{ host, port, timeoutMs, allowPrivate }`。
+ * @returns `{ ok, ms, error }`
+ */
+export function probeTcp(input) {
+  const host = String(input?.host ?? '').trim()
+  const port = Number(input?.port) || 0
+  const timeoutMs = Number(input?.timeoutMs) || 5000
+  const allowPrivate = input?.allowPrivate === true
+  if (!allowPrivate) {
+    const blocked = blockedHostReason(host)
+    if (blocked !== '') return Promise.resolve({ ok: false, ms: 0, error: blocked })
+  }
+  if (host === '' || port <= 0) return Promise.resolve({ ok: false, ms: 0, error: '缺少主机或端口' })
+  const started = Date.now()
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    const socket = connect({ host, port })
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => done({ ok: true, ms: Date.now() - started, error: '' }))
+    socket.once('timeout', () => done({ ok: false, ms: Date.now() - started, error: '连接超时' }))
+    socket.once('error', (cause) => done({
+      ok: false,
+      ms: Date.now() - started,
+      error: cause instanceof Error ? cause.message : String(cause),
+    }))
+  })
 }
 
 /**

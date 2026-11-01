@@ -1260,6 +1260,40 @@ export class HunterStore {
     return coverageOf(this.assetsOf(sessionId), this.linksOf(sessionId))
   }
 
+  /**
+   * 写回一次验活结果（`expose_verify` 用）。
+   *
+   * 验活是**观测**，不是新资产：连不上就标 `dead`（保留原字段与证据），
+   * 连上了就把这次观测到的字段合并进去（状态码/标题/响应头/正文/证书都可能变了）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} key - 资产键。
+   * @param {object} result - `{ live, at?, fields? }`。
+   * @returns {Promise<object | undefined>} 更新后的资产；键不存在时返回 undefined。
+   */
+  async applyVerification(sessionId, key, result) {
+    const physical = `${sessionId}:${key}`
+    const row = this.#assets.get(physical)
+    if (row === undefined) return undefined
+    const at = Number(result?.at) || Date.now()
+    const next = {
+      ...row,
+      lifecycle: result?.live === true ? 'live' : 'dead',
+      lastVerifiedAt: at,
+    }
+    if (result?.live === true && result?.fields !== undefined && result.fields !== null) {
+      for (const [field, value] of Object.entries(result.fields)) {
+        if (value === undefined || value === null) continue
+        const empty = Array.isArray(value) ? value.length === 0 : String(value).trim() === ''
+        if (empty) continue
+        next[field] = value
+      }
+    }
+    await this.#persistAsset(sessionId, next)
+    this.#bump(sessionId)
+    return next
+  }
+
   // ── 关联关系：从已有资产与记录里算，不落新表 ──────────────────────────
 
   /**

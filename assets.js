@@ -101,6 +101,26 @@ export const NODE_TYPES = ['endpoint', 'app']
 export const MERGE_STATES = ['single', 'merged', 'unresolved']
 
 /**
+ * 资产生命周期 —— 空间测绘的结果会过期，必须能被"验活"改写。
+ *
+ * - live：刚验证过，能连上（HTTP 资产还能拿到响应）；
+ * - dead：验证时连不上 / 无法访问 —— **不删除**，只标记，保留证据；
+ * - 空串：从未验证过。
+ */
+export const LIFECYCLES = ['live', 'dead']
+
+/**
+ * 收敛为合法的生命周期。
+ *
+ * @param value - 任意值。
+ * @returns live / dead / 空串（未验证）。
+ */
+export function asLifecycle(value) {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return LIFECYCLES.includes(text) ? text : ''
+}
+
+/**
  * 主机资产的分面（面板上那 8 个 chip）。
  *
  * 这是**协议族**，不是端口号：只看实测到的 `protocol` / `service`，
@@ -419,6 +439,9 @@ export function normalizeAsset(raw) {
      * 面板上要能区分"这就是系统入口"和"我们从端点推出来的根路径"。
      */
     derived: source.derived === true,
+    // 验活结果：由 expose_verify 写入，模型不填。
+    lifecycle: asLifecycle(source.lifecycle),
+    lastVerifiedAt: Number.isFinite(source.lastVerifiedAt) ? Number(source.lastVerifiedAt) : 0,
   }
 }
 
@@ -596,6 +619,8 @@ const FIELDS = {
   // URL（系统的键 + 所有 URL 证据）。
   url: 'url', urls: 'url',
   mergeState: 'mergeState', mergestate: 'mergeState',
+  // 验活：lifecycle=dead 捞出所有已失效资产。
+  lifecycle: 'lifecycle', verified: 'lifecycle',
   // 判定等级：`verdict=suspect` / `verdict=infer`（面板端点旁的记号）。
   verdict: 'verdict', mark: 'verdict',
 }

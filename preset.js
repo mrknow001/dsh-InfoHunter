@@ -28,7 +28,7 @@ import {
   describeKinds, describeShapeLegend, describePurposes, describeShapes, shapeIdList,
 } from './vocabulary.js'
 import { describeQuery, splitEndpoint } from './assets.js'
-import { probeHttp, resolveHost } from './fetch.js'
+import { probeHttp, probeTcp, resolveHost } from './fetch.js'
 import { LAYERS } from './coverage.js'
 import { planProgress } from './plan.js'
 import { defaultSkillsRoot, readSkillFromDir, validateSkill } from './skillpack.js'
@@ -1209,7 +1209,137 @@ function registerTools(ctx, store) {
     },
   })
 
-  // ── 7. 查询资产 ────────────────────────────────────────────────────────
+  // ── 7. 验活：空间测绘结果必须二次验证 ──────────────────────────────────
+  registerToolSafely(ctx, {
+    name: 'expose_verify',
+    description:
+      '对资产做**二次验证**：空间测绘/搜索引擎的结果经常是几个月前的，端口早关了、站点早换了。\n'
+      + '做两件事：① TCP 连通性（IP+端口还开着吗）；② 对 http/https 端口发一次 GET，'
+      + '拿回状态码 / 标题 / 响应头 / 正文 / TLS 证书。\n'
+      + '**连不上 → 标为失效（lifecycle=dead）**，保留原数据不删除；连得上 → 标 live，'
+      + '并把这次观测到的字段合并进去（所以证书、响应头、正文会一起补上）。\n'
+      + '回执会列出**变更**：状态码、标题、协议发生了变化。\n'
+      + '默认验证本会话全部 Web 端点（最多 30 个）；也可以显式指定 targets。',
+    parameters: {
+      type: 'object',
+      properties: {
+        allWeb: { type: 'boolean', description: '验证本会话所有 http/https 端点（默认 false）。' },
+        targets: {
+          type: 'array',
+          description: '显式指定要验证的端点（最多 30 个）。',
+          items: {
+            type: 'object',
+            properties: {
+              host: { type: 'string' },
+              port: { type: 'number' },
+              scheme: { type: 'string', enum: ['http', 'https'] },
+            },
+            required: ['host', 'port'],
+            additionalProperties: false,
+          },
+        },
+        limit: { type: 'number', description: 'allWeb 时最多验多少个，缺省 30、最大 60。' },
+      },
+      additionalProperties: false,
+    },
+    output: OUTPUT,
+    timeoutMs: 300_000,
+    async execute(args, exec) {
+      const sessionId = sessionIdOf(exec)
+      if (sessionId === undefined) throw new Error('没有归属会话，无法验证')
+      const assets = store.assetsOf(sessionId)
+      const byKey = new Map(assets.map((row) => [row.key, row]))
+
+      let targets = []
+      if (args?.allWeb === true) {
+        const limit = Math.min(60, Math.max(1, Number(args?.limit) || 30))
+        targets = assets
+          .filter((row) => row.nodeType !== 'app' && Number(row.port) > 0
+            && (row.protocol === 'http' || row.protocol === 'https'))
+          .slice(0, limit)
+          .map((row) => ({ host: row.host, port: Number(row.port), scheme: row.protocol }))
+      } else if (Array.isArray(args?.targets)) {
+        targets = args.targets.slice(0, 30)
+          .map((item) => ({
+            host: String(item?.host ?? '').trim(),
+            port: Number(item?.port) || 0,
+            scheme: item?.scheme === 'https' ? 'https' : item?.scheme === 'http' ? 'http' : undefined,
+          }))
+          .filter((item) => item.host !== '' && item.port > 0)
+      }
+      if (targets.length === 0) throw new Error('没有可验证的目标：传 targets，或 allWeb=true')
+
+      const lines = []
+      let live = 0
+      let dead = 0
+      let changed = 0
+
+      for (const target of targets) {
+        const scheme = target.scheme ?? (target.port === 443 ? 'https' : 'http')
+        const key = `${target.host}:${target.port}`
+        const stored = byKey.get(key)
+        const tcp = await probeTcp({ host: target.host, port: target.port, timeoutMs: 6000 })
+        if (tcp.ok !== true) {
+          dead += 1
+          if (stored !== undefined) await store.applyVerification(sessionId, key, { live: false })
+          lines.push(`${key} → 连接失败（${tcp.error}）· 已标记失效`)
+          continue
+        }
+        const probe = await probeHttp({ host: target.host, port: target.port, scheme })
+        if (probe.ok !== true) {
+          // 端口开着但 HTTP 不通：可能是非 HTTP 服务，算"活着"但没 Web 证据。
+          live += 1
+          if (stored !== undefined) await store.applyVerification(sessionId, key, { live: true })
+          lines.push(`${key} → 端口开着，但 HTTP 不通（${probe.error}）`)
+          continue
+        }
+        live += 1
+        const server = (() => {
+          const match = /^server:\s*(.+)$/im.exec(String(probe.headers ?? ''))
+          return match === null ? '' : match[1].trim()
+        })()
+        const fields = {
+          protocol: scheme,
+          status: probe.status,
+          title: probe.title,
+          server,
+          headers: probe.headers,
+          body: probe.body,
+          ...(probe.cert === undefined ? {} : {
+            certSubject: probe.cert.subject,
+            certIssuer: probe.cert.issuer,
+            certSan: probe.cert.san,
+            certNotAfter: probe.cert.notAfter,
+          }),
+        }
+        if (stored !== undefined) await store.applyVerification(sessionId, key, { live: true, fields })
+        const diffs = []
+        if (stored !== undefined) {
+          if ((stored.status ?? 0) !== probe.status) diffs.push(`状态码 ${stored.status ?? 0} → ${probe.status}`)
+          if ((stored.title ?? '') !== probe.title && probe.title !== '') diffs.push(`标题「${probe.title}」`)
+          if ((stored.protocol ?? '') !== scheme) diffs.push(`协议 ${stored.protocol || '—'} → ${scheme}`)
+        }
+        if (diffs.length > 0) changed += 1
+        lines.push(`${key} → ${probe.status}${probe.title === '' ? '' : `「${probe.title}」`}`
+          + `${probe.cert === undefined ? '' : ' · 证书已补'}`
+          + `${diffs.length === 0 ? '' : ` · 变更：${diffs.join('；')}`}`)
+      }
+
+      // 验活也是观测：写一条记录留痕（合并进同一资产，不会新增行）。
+      const records = lines.map((line, index) => ({
+        kind: 'web',
+        asset: targets[index] === undefined ? '' : `${targets[index].host}:${targets[index].port}`,
+        detail: line,
+        sources: ['expose_verify'],
+      })).filter((row) => row.asset !== '')
+      if (records.length > 0) await store.appendRecords(sessionId, records)
+
+      const head = `验证 ${targets.length} 个端点：存活 ${live}，失效 ${dead}，有变更 ${changed}`
+      return { text: `${head}\n${lines.join('\n')}`, verified: targets.length, live, dead, changed }
+    },
+  })
+
+  // ── 8. 查询资产 ────────────────────────────────────────────────────────
   registerToolSafely(ctx, {
     name: 'expose_asset_query',
     description:
@@ -1812,6 +1942,13 @@ const INSTRUCTIONS = `\
 顺序永远是先用户配置的工具、拿不到再用它补；它不做端口扫描、不做指纹识别。
 面板「证书 / 响应头 / 正文」三个页签读的就是这些字段 —— 不补就是一片"未采集"。
 常见缺口：测绘平台只回状态码不给证书；子域枚举只给域名不给 IP（补 DNS 即可）。
+
+**空间测绘/搜索引擎的结果必须二次验证**：那些数据经常是几个月前的，端口早关了、站点早换了。
+用 expose_verify（缺省验本会话全部 Web 端点）：
+- 连不上 → 自动标为失效（lifecycle=dead），**数据保留，不删除**；
+- 连得上 → 标 live，并把这次观测到的状态码 / 标题 / 响应头 / 正文 / 证书一起合并进去；
+- 回执里的**变更**（状态码 200→404、标题换了、协议变了）要写进最终汇总 —— 那才是用户要看的增量。
+验收类工作（用户说"确认一下还活着吗"）也是它，不要凭旧数据回答。
 
 **别把工具输出整段塞进 detail 就完事。** 我们的价值不在于"调用了工具"，而在于把工具输出
 整理成结构化资产：工具回了 IP、端口、状态码、服务名、版本、标题，就逐个写进对应字段。

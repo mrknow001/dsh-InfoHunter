@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
      * 所以它不会静默漂移。它的用处是识别"页面是旧的"：改完 `client.js` 后没刷新页面时，
      * 宿主报的是新版本、界面还是旧代码，这时面板会显示两者不一致并提示刷新。
      */
-    const CLIENT_VERSION = '0.15.1'
+    const CLIENT_VERSION = '0.16.0'
 
     /** 用途 id —— 与宿主 `vocabulary.js` 的 PURPOSES 同序同值。 */
     const PURPOSES = [
@@ -278,6 +278,8 @@ window.__ModuleLoader__.load({
       'card.root': '根路径',
       'card.noPort': '缺端口',
       'card.noPortHint': '这条记录声明了 Web，却没有端口 —— 采集时漏了，写成 host:端口 才能补全。',
+      'card.dead': '失效',
+      'card.deadHint': '上次验证时连不上 / 无法访问 —— 数据保留，只标记失效。',
       'card.noIp': '缺 IP',
       'card.noIpHint': '有端口但没记解析 IP —— 工具输出里通常有，补记一条即可。',
       'card.rootHint': '这个 Web 资产是由端点自动派生的根路径（不是模型显式登记的系统入口）。',
@@ -637,6 +639,8 @@ window.__ModuleLoader__.load({
       'card.root': 'root',
       'card.noPort': 'no port',
       'card.noPortHint': 'This record claims web but has no port — record host:port to fix it.',
+      'card.dead': 'dead',
+      'card.deadHint': 'Unreachable at last verification — kept, only flagged.',
       'card.noIp': 'no IP',
       'card.noIpHint': 'Port recorded without a resolved IP — usually available from the tool output.',
       'card.rootHint': 'This web asset is the root path derived from its endpoint (not an explicitly recorded system entry).',
@@ -1188,6 +1192,9 @@ window.__ModuleLoader__.load({
         systemConfidence: String(row.systemConfidence ?? ''),
         /** 由端点派生的根路径资产（不是模型显式登记的系统）。 */
         derived: row.derived === true,
+        /** 验活结果：dead = 上次验证连不上（不删除，只标记）。 */
+        lifecycle: String(row.lifecycle ?? ''),
+        lastVerifiedAt: Number(row.lastVerifiedAt) || 0,
         /**
          * 卡片上并排展示的字段。**空值也保留**（value 为空串），渲染层统一显示 `—` ——
          * 隐藏空字段会让人以为"没这一项"，而这里恰恰要让人看见"没采到"。
@@ -1331,6 +1338,16 @@ window.__ModuleLoader__.load({
                   title: t('card.systemBadgeHint'),
                   style: { color: T.brand, border: `1px solid ${tint(T.brand, 0.45)}`, background: tint(T.brand, 0.1) },
                 }, t('card.systemBadge'))
+              : null,
+            // 验活失败：空间测绘的过期结果，一眼能看出来。
+            model.lifecycle === 'dead'
+              ? h('span', {
+                  className: 'ih-acard-badge',
+                  title: model.lastVerifiedAt === 0
+                    ? t('card.deadHint')
+                    : `${t('card.deadHint')}\n${new Date(model.lastVerifiedAt).toLocaleString()}`,
+                  style: { color: T.error, border: `1px solid ${tint(T.error, 0.45)}`, background: tint(T.error, 0.1) },
+                }, t('card.dead'))
               : null,
             // 记录质量角标：不展开详情就能看出这条记录不完整。
             model.isWeb && model.port === 0 && !model.isApp

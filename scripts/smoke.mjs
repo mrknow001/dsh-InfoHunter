@@ -890,6 +890,17 @@ try {
   const afterFail = await store5.startTask('session-task', { target: 'x.example.com', layer: 'ports', tool: 'naabu' })
   check(afterFail.duplicate === true, '派活：失败过的也不重复派（除非换工具）')
 
+  await store5.upsertAssets('session-verify', [
+    { host: 'v.example.com', port: 443, protocol: 'https', status: 200, title: '旧标题' },
+  ])
+  const deadRow = await store5.applyVerification('session-verify', 'v.example.com:443', { live: false })
+  check(deadRow.lifecycle === 'dead' && deadRow.title === '旧标题', '验活：连不上标 dead，不删原字段',
+    JSON.stringify({ lifecycle: deadRow.lifecycle, title: deadRow.title }))
+  const liveRow = await store5.applyVerification('session-verify', 'v.example.com:443', { live: true, fields: { status: 404, title: '新标题' } })
+  check(liveRow.lifecycle === 'live' && liveRow.status === 404 && liveRow.title === '新标题',
+    '验活：连上则合并新观测（状态码/标题）', JSON.stringify({ lifecycle: liveRow.lifecycle, status: liveRow.status }))
+  check(store5.pageAssets('session-verify', { q: 'lifecycle=live' }).total === 1, '验活：可按 lifecycle 查询')
+
   await store5.link('session-task', 'x.example.com:443', 'artifact')
   const taskCoverage = store5.coverage('session-task')
   check(taskCoverage.total >= 0, '覆盖度：从存储取到结构', JSON.stringify({ total: taskCoverage.total }))
@@ -933,6 +944,11 @@ try {
   check(probed.title === '补全测试', '补全：探测拿到标题', probed.title)
   check(probed.headers.includes('x-test: ok'), '补全：探测拿到响应头原文')
   check(probed.body.includes('hello 世界'), '补全：探测拿到正文摘要')
+  const tcpOpen = await fetchMod.probeTcp({ host: '127.0.0.1', port, allowPrivate: true })
+  check(tcpOpen.ok === true, '验活：TCP 探测到开放端口', JSON.stringify(tcpOpen))
+  const tcpClosed = await fetchMod.probeTcp({ host: '127.0.0.1', port: 1, timeoutMs: 800, allowPrivate: true })
+  check(tcpClosed.ok === false, '验活：关闭端口判定失败', JSON.stringify(tcpClosed))
+
   await new Promise((resolve) => server.close(resolve))
 
   const blockedProbe = await fetchMod.probeHttp({ host: '127.0.0.1', port, scheme: 'http' })
@@ -1383,7 +1399,7 @@ try {
   const names = presetFake.tools.map((tool) => tool.name)
   const EXPECTED_TOOLS = [
     'expose_config', 'expose_mapping_call', 'expose_record', 'expose_artifact',
-    'expose_plan', 'expose_state', 'expose_task', 'expose_enrich', 'expose_asset_query',
+    'expose_plan', 'expose_state', 'expose_task', 'expose_enrich', 'expose_verify', 'expose_asset_query',
     'expose_question_list', 'expose_question_resolve', 'expose_tool_run', 'expose_run_query',
   ]
   check(names.length === EXPECTED_TOOLS.length, `注册了 ${EXPECTED_TOOLS.length} 个工具`, names.join(','))
