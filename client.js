@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
      * 所以它不会静默漂移。它的用处是识别"页面是旧的"：改完 `client.js` 后没刷新页面时，
      * 宿主报的是新版本、界面还是旧代码，这时面板会显示两者不一致并提示刷新。
      */
-    const CLIENT_VERSION = '0.18.0'
+    const CLIENT_VERSION = '0.18.1'
 
     /** 用途 id —— 与宿主 `vocabulary.js` 的 PURPOSES 同序同值。 */
     const PURPOSES = [
@@ -2356,6 +2356,9 @@ function AssetsArea(props) {
         coverage: null,
         rev: { config: 0, assets: 0 },
       })
+      // 探索图（抽屉）：全局线索/道路，跟资产同源刷新。
+      const [graph, setGraph] = useState({ nodes: [], state: null })
+      const [graphOpen, setGraphOpen] = useState(false)
       const [query, setQuery] = useState('')
       const [applied, setApplied] = useState('')
       const [category, setCategory] = useState('')
@@ -2394,6 +2397,9 @@ function AssetsArea(props) {
           props.onSynced?.(Date.now())
           // 计划与覆盖度是全局的：往上报给顶部栏。
           props.onStatus?.({ plan: payload.plan ?? null, coverage: payload.coverage ?? null })
+          void api(`/graph?sessionId=${encodeURIComponent(sessionId)}`)
+            .then((data) => setGraph({ nodes: data.nodes ?? [], state: data.state ?? null }))
+            .catch(() => { /* 图失败不影响资产列表 */ })
           setError('')
           revRef.current = payload.rev?.assets ?? revRef.current
         } catch (cause) {
@@ -2610,6 +2616,12 @@ function AssetsArea(props) {
             h('span', { style: { fontSize: 11.5, color: T.text3, marginLeft: 4 } },
               t('view.hint').replace('{systems}', String(overview.byNodeType?.app ?? 0)).replace('{endpoints}', String(overview.byNodeType?.endpoint ?? 0))),
           ),
+          h('button', {
+            type: 'button',
+            className: 'ih-graphbtn',
+            onClick: () => setGraphOpen(true),
+            title: t('graph.openHint'),
+          }, `${t('graph.title')} · ${t('graph.frontier')} ${graph.state?.open ?? 0}`),
           h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
             h('input', {
               value: query,

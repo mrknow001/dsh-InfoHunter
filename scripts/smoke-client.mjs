@@ -274,6 +274,52 @@ console.log('\n[7] 切回本预设 → 面板回来')
 renderWatcher('information-hunter')
 check(slotRegistry['conversation.view'].length === 1, '标签页回来了')
 
+console.log('\n[9] 面板组件深渲染（防"白屏"回归）')
+// 只挂载不渲染的话，组件内部的未定义变量（例如状态忘了放进这个组件）永远测不出来，
+// 真机上表现就是整个面板白屏。这里把 view 组件逐层调用一遍。
+const realIntervals = { set: globalThis.setInterval, clear: globalThis.clearInterval, fetch: globalThis.fetch }
+globalThis.setInterval = () => 0
+globalThis.clearInterval = () => {}
+globalThis.document = { visibilityState: 'visible' }
+globalThis.fetch = async () => ({ ok: false, status: 0, json: async () => ({}) })
+const faults = []
+try {
+  renderWatcher('information-hunter')
+  const viewEntry = slotRegistry['conversation.view'][0]
+  const deepRender = (element, depth) => {
+    if (element === null || element === undefined || depth > 10) return
+    if (Array.isArray(element)) { for (const item of element) deepRender(item, depth); return }
+    if (typeof element !== 'object' || typeof element.type !== 'function') {
+      deepRender(element?.props?.children, depth + 1)
+      return
+    }
+    const name = element.type.name === '' ? 'anonymous' : element.type.name
+    try {
+      deepRender(element.type({
+        sessionId: 'session-1',
+        t: (key) => key,
+        active: true,
+        useSessions: (selector) => selector({ byId: { 'session-1': { projectionValues: { agentPreset: 'information-hunter' } } } }),
+        useSession: () => ({ projectionValues: { agentPreset: 'information-hunter' } }),
+        ...element.props,
+      }), depth + 1)
+    } catch (cause) {
+      faults.push(`${name}: ${cause.message}`)
+    }
+  }
+  deepRender(viewEntry.component({
+    sessionId: 'session-1',
+    t: (key) => key,
+    active: true,
+    useSessions: (selector) => selector({ byId: { 'session-1': { projectionValues: { agentPreset: 'information-hunter' } } } }),
+  }), 0)
+} finally {
+  globalThis.setInterval = realIntervals.set
+  globalThis.clearInterval = realIntervals.clear
+  globalThis.fetch = realIntervals.fetch
+}
+check(faults.length === 0, '面板能渲染到底（没有未定义变量 / 空指针）', faults.join(' ; '))
+
 console.log('\n[8] 投影值是 null（会话没选预设）→ 不显示，且不算异常')
 renderWatcher(null)
 check(slotRegistry['conversation.view'].length === 0, 'null → 不显示面板', String(slotRegistry['conversation.view'].length))
