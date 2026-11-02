@@ -244,7 +244,7 @@ try {
 
   const backend = new SqliteKvBackend(dbPath)
   const openUnit = (version = UNIT_VERSION) =>
-    backend.kv.open({ name: UNIT_NAME, version, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+    backend.kv.open({ name: UNIT_NAME, version, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
 
   const unit = await openUnit()
   const store = new HunterStore(unit)
@@ -264,7 +264,7 @@ try {
   // 版本比介质新 → 拒绝读
   let newer
   try {
-    await backend.kv.open({ name: 'other', version: 99, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+    await backend.kv.open({ name: 'other', version: 99, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
     newer = undefined
   } catch (error) {
     newer = error.message
@@ -466,7 +466,7 @@ try {
   await store.unit.close()
   await backend.close()
   const backend2 = new SqliteKvBackend(dbPath)
-  const unit2 = await backend2.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+  const unit2 = await backend2.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
   const store2 = new HunterStore(unit2)
   await store2.load()
   check(store2.config().entries.length === 4, '重开后配置仍在', String(store2.config().entries.length))
@@ -610,7 +610,7 @@ try {
   await backend2.close()
 
   const backend3 = new SqliteKvBackend(dbPath)
-  const unit3 = await backend3.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+  const unit3 = await backend3.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
   const store3 = new HunterStore(unit3)
   await store3.load()
   check(store3.recentQueries().length === beforeReopen, '最近语句：重开后仍在（全局持久化）',
@@ -621,7 +621,7 @@ try {
 
   // 上限被调小之后：旧库里的多余语句要在**加载时**就淘汰，而不是等下一次查询。
   const backend4 = new SqliteKvBackend(dbPath)
-  const unit4 = await backend4.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+  const unit4 = await backend4.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
   for (let index = 0; index < 8; index += 1) {
     await unit4.putRecord('queries', `port=${2000 + index}`, {
       q: `port=${2000 + index}`, count: 1, lastUsedAt: 1000 + index,
@@ -687,7 +687,7 @@ try {
 
   // 存储侧：记录 → 端点 + 系统，内容页只当证据
   const backend5 = new SqliteKvBackend(dbPath)
-  const unit5 = await backend5.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links'], hasGlobal: false })
+  const unit5 = await backend5.kv.open({ name: UNIT_NAME, version: UNIT_VERSION, tables: ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges'], hasGlobal: false })
   const store5 = new HunterStore(unit5)
   await store5.load()
 
@@ -889,6 +889,37 @@ try {
   check(finished.state === 'failed' && finished.error === '超时', '派活：失败也留痕（负结果）')
   const afterFail = await store5.startTask('session-task', { target: 'x.example.com', layer: 'ports', tool: 'naabu' })
   check(afterFail.duplicate === true, '派活：失败过的也不重复派（除非换工具）')
+
+  // 探索图：线索 / 方向 / 发现
+  const clueA = await store5.addClue('session-graph', { text: 'A.com', source: 'domain' })
+  const clueB = await store5.addClue('session-graph', { text: ' a.com ', source: 'domain' })
+  check(clueA.duplicate === false && clueB.duplicate === true && clueA.node.id === clueB.node.id,
+    '图：线索按 source+text 去重')
+
+  const dirArgs = { target: 'a.com', method: 'bing', params: { q: 'site:a.com intitle:登录' }, needId: 'web', clueId: clueA.node.id }
+  const dirA = await store5.addDirection('session-graph', dirArgs)
+  const dirB = await store5.addDirection('session-graph', { ...dirArgs, params: { q: 'site:a.com intitle:后台' } })
+  check(dirA.node.id !== dirB.node.id, '图：参数不同是两条路')
+  const dirA2 = await store5.addDirection('session-graph', dirArgs)
+  check(dirA2.duplicate === true && dirA2.node.id === dirA.node.id, '图：同参复用同一条路')
+  check(store5.edgesOf('session-graph', dirA.node.id).some((edge) => edge.rel === 'derived_from'),
+    '图：方向挂上来源线索')
+
+  await store5.closeDirection('session-graph', dirA.node.id, 'done', '新增 12 个 host')
+  const dirA3 = await store5.addDirection('session-graph', dirArgs)
+  check(dirA3.restarted === true && dirA3.node.state === 'running', '图：重跑不新建节点，重置为 running')
+
+  let deadNeedsNote = false
+  try { await store5.closeDirection('session-graph', dirB.node.id, 'dead', '') } catch { deadNeedsNote = true }
+  check(deadNeedsNote, '图：标 dead 必须写原因')
+
+  const finding = await store5.addFinding('session-graph', { text: '系统 a.com', directionId: dirB.node.id })
+  check(finding.duplicate === false && store5.edgesOf('session-graph', finding.node.id).some((edge) => edge.rel === 'yields'),
+    '图：发现挂到方向上')
+
+  const graphState = store5.graphState('session-graph')
+  check(graphState.open + graphState.running + graphState.done + graphState.dead === 2
+    && graphState.clues === 1 && graphState.findings === 1, '图：态势计数', JSON.stringify(graphState))
 
   await store5.upsertAssets('session-verify', [
     { host: 'v.example.com', port: 443, protocol: 'https', status: 200, title: '旧标题' },
@@ -1352,7 +1383,8 @@ try {
       return [TOOL_ROW, EXEC_ROW, MAPPING_ROW, SKILL_ROW, MCP_ROW]
     },
     assetsOf: () => [],
-    appendRecords: async (sessionId, rows) => {
+    settings: () => ({ collection: { enforceDirection: false } }),
+      appendRecords: async (sessionId, rows) => {
       const written = rows.map((row, index) => ({ id: `rec-${index}`, sessionId, ...row, createdAt: Date.now() }))
       // 桩：按端点去重，模拟真实 store 的"记录 + 汇总"计数。
       const keys = new Set()
@@ -1399,7 +1431,9 @@ try {
   const names = presetFake.tools.map((tool) => tool.name)
   const EXPECTED_TOOLS = [
     'expose_config', 'expose_mapping_call', 'expose_record', 'expose_artifact',
-    'expose_plan', 'expose_state', 'expose_task', 'expose_enrich', 'expose_verify', 'expose_asset_query',
+    'expose_plan', 'expose_state', 'expose_task', 'expose_enrich',
+    'expose_clue', 'expose_direction', 'expose_graph',
+    'expose_verify', 'expose_asset_query',
     'expose_question_list', 'expose_question_resolve', 'expose_tool_run', 'expose_run_query',
   ]
   check(names.length === EXPECTED_TOOLS.length, `注册了 ${EXPECTED_TOOLS.length} 个工具`, names.join(','))
@@ -1481,6 +1515,45 @@ try {
       '事实资产不带标记')
   } finally {
     stubStore.pageAssets = realPage
+  }
+
+  // 探索图硬闸：没有方向不许落库；方向有效才放行。
+  const gateBackup = {
+    settings: stubStore.settings,
+    nodeById: stubStore.nodeById,
+    appendRecords: stubStore.appendRecords,
+    addFinding: stubStore.addFinding,
+    claimDirection: stubStore.claimDirection,
+  }
+  try {
+    let findingCount = 0
+    stubStore.settings = () => ({ collection: { enforceDirection: true } })
+    stubStore.nodeById = (_sid, id) => (id === 'n-test' ? { id: 'n-test', kind: 'direction', payload: {} } : undefined)
+    stubStore.appendRecords = async (_sid, rows) => ({ written: rows, added: 0, merged: 0 })
+    stubStore.addFinding = async () => { findingCount += 1; return { node: { id: `f${findingCount}` }, duplicate: false } }
+    stubStore.claimDirection = async () => undefined
+    const recordTool = presetFake.tools.find((tool) => tool.name === 'expose_record')
+    let rejected = false
+    try {
+      await recordTool.execute({ records: [{ asset: 'g.example.com:443', kind: 'web', protocol: 'https' }] }, { agent: { id: 's1' } })
+    } catch { rejected = true }
+    check(rejected, '硬闸：没有 directionId 的记录被拒')
+    let badId = false
+    try {
+      await recordTool.execute({ directionId: 'nope', records: [{ asset: 'g.example.com:443', kind: 'web' }] }, { agent: { id: 's1' } })
+    } catch { badId = true }
+    check(badId, '硬闸：directionId 不存在时拒绝')
+    const passed = await recordTool.execute({
+      directionId: 'n-test',
+      records: [{ asset: 'g.example.com:443', kind: 'web', protocol: 'https' }],
+    }, { agent: { id: 's1' } })
+    check(findingCount >= 1 && passed.recorded === 1, '硬闸：带方向放行并产出「发现」')
+  } finally {
+    stubStore.settings = gateBackup.settings
+    stubStore.nodeById = gateBackup.nodeById
+    stubStore.appendRecords = gateBackup.appendRecords
+    stubStore.addFinding = gateBackup.addFinding
+    stubStore.claimDirection = gateBackup.claimDirection
   }
 
   // 完整性自检：工具输出里有 IP/状态码却没写进字段的，回执必须点名。

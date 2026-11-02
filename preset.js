@@ -376,6 +376,30 @@ function softFieldsMissing(row) {
 }
 
 /**
+ * 写入前必须绑定一条探索方向。
+ *
+ * 这是"不许偷懒"的硬闸：没有领路就落库，等于把"为什么采这条"丢掉。
+ * 开关在设置页（collection.enforceDirection），默认开。
+ *
+ * @param store - 会话存储。
+ * @param args - 工具参数。
+ * @param sessionId - 归属会话。
+ * @returns 方向节点；开关关闭时返回 undefined。
+ */
+function requireDirection(store, args, sessionId) {
+  const settings = typeof store.settings === 'function' ? store.settings() : {}
+  const enforce = settings?.collection?.enforceDirection !== false
+  if (!enforce) return undefined
+  const id = typeof args?.directionId === 'string' ? args.directionId.trim() : ''
+  if (id === '') {
+    throw new Error('这条写入没有绑定探索方向：先 expose_direction 领一条路，再把返回的 id 作为 directionId 传进来')
+  }
+  const node = store.nodeById(sessionId, id)
+  if (node === undefined || node.kind !== 'direction') throw new Error(`directionId 不存在或不是方向节点：${id}`)
+  return node
+}
+
+/**
  * 注册工具，失败只警告不中断。
  *
  * 一个工具的定义被注册表拒绝时（超时上限、schema 形状等），原来的写法会让
@@ -702,6 +726,7 @@ function registerTools(ctx, store) {
     parameters: {
       type: 'object',
       properties: {
+        directionId: { type: 'string', description: '**必填**：这次写入属于哪条探索方向（先 expose_direction claim 拿 id）。没有方向就不许落库。' },
         target: { type: 'string', description: '这批观测属于哪个根目标（主域名 / IP / 组织名）。' },
         records: {
           type: 'array',
@@ -780,6 +805,7 @@ function registerTools(ctx, store) {
     async execute(args, exec) {
       const sessionId = sessionIdOf(exec)
       if (sessionId === undefined) throw new Error('没有归属会话，无法记录')
+      const direction = requireDirection(store, args, sessionId)
       const target = String(args?.target ?? '').trim()
       const raw = Array.isArray(args?.records) ? args.records : []
       if (raw.length === 0) throw new Error('records 不能为空')
@@ -810,6 +836,13 @@ function registerTools(ctx, store) {
       }
 
       const { written, added, merged } = await store.appendRecords(sessionId, records)
+      // 每条落库的观测都是一次「发现」，挂到方向上：图里能看到这条路产出了什么。
+      if (direction !== undefined) {
+        for (const row of written.slice(0, 50)) {
+          await store.addFinding(sessionId, { text: `${row.kind} ${row.asset}`, directionId: direction.id })
+        }
+        await store.claimDirection(sessionId, direction.id)
+      }
 
       // ## 完整性自检（按字段，不按 kind）
       //
@@ -863,6 +896,7 @@ function registerTools(ctx, store) {
     parameters: {
       type: 'object',
       properties: {
+        directionId: { type: 'string', description: '**必填**：这次写入属于哪条探索方向（先 expose_direction claim 拿 id）。' },
         items: {
           type: 'array',
           description: '一次 1–200 条。同一条产物重复提交只累加次数，不会变两行。',
@@ -909,10 +943,17 @@ function registerTools(ctx, store) {
     async execute(args, exec) {
       const sessionId = sessionIdOf(exec)
       if (sessionId === undefined) throw new Error('没有归属会话，无法记录产物')
+      const direction = requireDirection(store, args, sessionId)
       const items = Array.isArray(args?.items) ? args.items : []
       if (items.length === 0) throw new Error('items 不能为空')
       if (items.length > 200) throw new Error(`一次最多 200 条（收到 ${items.length} 条），请分批`)
       const { written, added, duplicated, hits } = await store.appendArtifacts(sessionId, items)
+      if (direction !== undefined) {
+        for (const row of written.slice(0, 50)) {
+          await store.addFinding(sessionId, { text: `artifact ${row.title || row.kind}`, directionId: direction.id })
+        }
+        await store.claimDirection(sessionId, direction.id)
+      }
       const parts = [`记录 ${written.length} 条产物（新增 ${added}，重复合并 ${duplicated}）`]
       if (hits > 0) {
         const flagged = written.filter((row) => row.hits.length > 0)
@@ -1024,6 +1065,7 @@ function registerTools(ctx, store) {
       const missingIp = assets.filter((row) => (row.port ?? 0) > 0 && String(row.ip ?? '') === '')
       const openQuestions = store.questionsOf(sessionId, 'open')
       const tasks = store.tasksOf(sessionId)
+      const graph = store.graphState(sessionId)
       const layerLine = LAYERS.map((layer) => `${layer.label} ${coverage.byLayer[layer.id] ?? 0}/${coverage.total}`).join(' · ')
       const current = plan.stages.find((stage) => stage.state === 'active')
         ?? plan.stages.find((stage) => stage.state === 'pending')
@@ -1035,6 +1077,8 @@ function registerTools(ctx, store) {
           `未覆盖 ${coverage.uncovered.length}（共 ${coverage.total}）`,
           `缺口：缺端口 ${missingPort.length} 条、缺 IP ${missingIp.length} 条、待确认 ${openQuestions.length} 条`,
           `派活：进行中 ${tasks.filter((row) => row.state === 'running').length} / 完成 ${tasks.filter((row) => row.state === 'done').length} / 失败 ${tasks.filter((row) => row.state === 'failed').length}`,
+        `探索：线索 ${graph.clues}（未用 ${graph.cluesUnused}） · 路 待走 ${graph.open} / 进行中 ${graph.running} / 已走 ${graph.done} / 走不通 ${graph.dead}`
+          + (graph.overdue.length === 0 ? '' : ` · **超时 ${graph.overdue.length}**`),
         ].join('\n'),
         progress,
         coverage,
@@ -1206,6 +1250,174 @@ function registerTools(ctx, store) {
       const written = records.length === 0 ? { written: [], added: 0, merged: 0 } : await store.appendRecords(sessionId, records)
       const head = `补全 ${results.length} 个目标，写入 ${written.written.length} 条记录（新增 ${written.added}，合并 ${written.merged}）`
       return { text: `${head}\n${lines.join('\n')}`, targets: results.length, recorded: written.written.length }
+    },
+  })
+
+  // ── 7. 探索图：需求 / 线索 / 路 ────────────────────────────────────────
+  registerToolSafely(ctx, {
+    name: 'expose_clue',
+    description:
+      '登记或查看**线索**：主域名、单位名、证书 SAN 里的域名、ICP、C 段、必应命中、产物里的凭据/域名…\n'
+      + '线索是"要去查的东西"，不是结论。查到新线索就立刻登记，否则上下文一压缩就丢了。\n'
+      + '线索要有去向：要么派生出至少一条探索方向（expose_direction），要么标 dead（确认无价值）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'list', 'dead'], description: 'add 登记；list 列出；dead 标死。' },
+        id: { type: 'string', description: 'dead 用：线索节点 id。' },
+        text: { type: 'string', description: 'add 用：线索正文（域名 / IP / 单位名 / 短语）。' },
+        source: {
+          type: 'string',
+          description: 'add 用：来源，如 domain / cert-san / icp / cidr / bing / artifact / title / manual。',
+        },
+        priority: { type: 'number', description: 'add 用：优先级 0–100，越大越先做。' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: OUTPUT,
+    timeoutMs: 30_000,
+    async execute(args, exec) {
+      const sessionId = sessionIdOf(exec)
+      if (sessionId === undefined) throw new Error('没有归属会话')
+      if (args?.action === 'list') {
+        const clues = store.nodesOf(sessionId, 'clue')
+        if (clues.length === 0) return { text: '线索池是空的。' }
+        const lines = clues.slice(-50).map((node) => {
+          const mark = node.state === 'dead' ? '✗' : node.state === 'used' ? '✓' : '·'
+          return `${mark} ${node.id}  ${node.text}  [${node.payload?.source ?? ''}]`
+        })
+        return { text: `线索 ${clues.length} 条（未用 ${clues.filter((node) => node.state === 'open').length}）：\n${lines.join('\n')}` }
+      }
+      if (args?.action === 'dead') {
+        const id = typeof args?.id === 'string' ? args.id : ''
+        const node = store.nodeById(sessionId, id)
+        if (node === undefined || node.kind !== 'clue') throw new Error(`没有这条线索：${id}`)
+        const updated = await store.closeClue(sessionId, id)
+        return { text: `线索已标死：${updated?.text ?? id}` }
+      }
+      const { node, duplicate } = await store.addClue(sessionId, {
+        text: args?.text,
+        source: args?.source ?? 'manual',
+        priority: args?.priority,
+      })
+      return {
+        text: duplicate ? `线索已存在（${node.id}）：${node.text}` : `线索已登记（${node.id}）：${node.text}`,
+        id: node.id,
+        duplicate,
+      }
+    },
+  })
+
+  registerToolSafely(ctx, {
+    name: 'expose_direction',
+    description:
+      '登记 / 领取 / 结算**一条路**。一条路 = (对象, 方法, 参数, 目的)，判据是"重跑能得到同一批结果"。\n'
+      + '`add`：给 target / method / params / needId 登记（已存在则复用）。\n'
+      + '`claim`：领一条路（按 id 或按 target+method 找），返回它的线索上下文，之后调工具与写入都必须带这个 id。\n'
+      + '`done`：走完了（有产出，或确认没新东西）。`dead`：走不通（工具不可用/验证码/目标下线），**必须写原因**。\n'
+      + '注意：没收获 ≠ 走不通 —— 没东西就 done，别把路标死。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'claim', 'done', 'dead'], description: '登记 / 领取 / 完成 / 走不通。' },
+        id: { type: 'string', description: 'claim / done / dead 用：方向节点 id。' },
+        target: { type: 'string', description: 'add 用：对象（host / 域名 / IP / C 段 / 单位名）。' },
+        method: { type: 'string', description: 'add 用：方法（subfinder / bing / naabu / httpx / expose_enrich …）。' },
+        params: {
+          type: 'object',
+          description: 'add 用：决定范围的那些参数（查询式、端口区间、字典、目标数量）。',
+          additionalProperties: true,
+        },
+        needId: { type: 'string', description: 'add 用：服务哪个需求（web / ports / impostor / cert / other）。' },
+        clueId: { type: 'string', description: 'add 用：这条路由哪条线索派生。' },
+        priority: { type: 'number', description: 'add 用：优先级。' },
+        note: { type: 'string', description: 'done / dead 用：产出摘要或失败原因。' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: OUTPUT,
+    timeoutMs: 30_000,
+    async execute(args, exec) {
+      const sessionId = sessionIdOf(exec)
+      if (sessionId === undefined) throw new Error('没有归属会话')
+      const action = String(args?.action ?? '')
+      if (action === 'add') {
+        const { node, duplicate, restarted } = await store.addDirection(sessionId, {
+          target: args?.target,
+          method: args?.method,
+          params: args?.params,
+          needId: args?.needId,
+          clueId: args?.clueId,
+          priority: args?.priority,
+        })
+        const state = restarted ? '这条路走过，已重置为 running（重跑）' : duplicate ? '这条路已存在，复用' : '已登记'
+        return { text: `方向 ${node.id}：${node.payload?.method} · ${node.payload?.target} · ${state}`, id: node.id }
+      }
+      if (action === 'claim') {
+        const id = typeof args?.id === 'string' ? args.id : ''
+        if (id === '') throw new Error('claim 需要 id（先 add，或从 expose_graph 的 frontier 里选）')
+        const node = store.nodeById(sessionId, id)
+        if (node === undefined || node.kind !== 'direction') throw new Error(`没有这条方向：${id}`)
+        const edges = store.edgesOf(sessionId, node.id)
+        const clue = edges
+          .filter((edge) => edge.to === node.id && edge.rel === 'derived_from')
+          .map((edge) => store.nodeById(sessionId, edge.from))
+          .find((item) => item !== undefined)
+        if (node.state !== 'running') await store.claimDirection(sessionId, node.id)
+        return {
+          text: [
+            `已领路 ${node.id}：${node.payload?.method} · ${node.payload?.target}`,
+            `参数：${JSON.stringify(node.payload?.params ?? {})}`,
+            `需求：${node.payload?.needId ?? 'other'}`,
+            clue === undefined ? '来源线索：无' : `来源线索：${clue.text}`,
+            '接下来：调用工具 → expose_record / expose_artifact 必须带这个 directionId → 最后 done/dead。',
+          ].join('\n'),
+          id: node.id,
+          payload: node.payload,
+        }
+      }
+      if (action === 'done' || action === 'dead') {
+        const id = typeof args?.id === 'string' ? args.id : ''
+        const node = await store.closeDirection(sessionId, id, action, args?.note ?? '')
+        if (node === undefined) throw new Error(`没有这条方向：${id}`)
+        return { text: `方向 ${id} → ${action}${action === 'dead' ? `（${args?.note}）` : ''}` }
+      }
+      throw new Error('action 只能是 add / claim / done / dead')
+    },
+  })
+
+  registerToolSafely(ctx, {
+    name: 'expose_graph',
+    description:
+      '探索图态势：需求进度、线索池（未用/共）、道路（待走/进行中/已走/走不通）、超时未回的路、最近发现。\n'
+      + '**每轮开始先看它**：它告诉你还有哪些路没走、哪条线索还没用、哪条路卡住了 —— 不要凭记忆决定下一步。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: OUTPUT,
+    timeoutMs: 30_000,
+    async execute(_args, exec) {
+      const sessionId = sessionIdOf(exec)
+      if (sessionId === undefined) throw new Error('没有归属会话')
+      const state = store.graphState(sessionId)
+      const lines = [
+        `需求 ${state.needs}（已达成 ${state.needsMet}） · 线索 ${state.clues}（未用 ${state.cluesUnused}）`,
+        `道路：待走 ${state.open} · 进行中 ${state.running} · 已走 ${state.done} · 走不通 ${state.dead} · 发现 ${state.findings}`,
+      ]
+      if (state.overdue.length > 0) {
+        lines.push(`**超时未回 ${state.overdue.length} 条**（running > 20 分钟）：`)
+        for (const node of state.overdue.slice(0, 10)) {
+          lines.push(`  ${node.id} ${node.payload?.method} · ${node.payload?.target}`)
+        }
+      }
+      if (state.frontier.length === 0) lines.push('frontier 为空：没有登记待走的路。')
+      else {
+        lines.push('待走的路（优先级高的在前）：')
+        for (const node of state.frontier.slice(0, 10)) {
+          lines.push(`  ${node.id}  ${node.payload?.method} · ${node.payload?.target} · ${JSON.stringify(node.payload?.params ?? {})} [${node.payload?.needId ?? 'other'}]`)
+        }
+      }
+      return { text: lines.join('\n'), state }
     },
   })
 
@@ -1892,6 +2104,11 @@ const INSTRUCTIONS = `\
 
 之后每一轮开工**先调 expose_state**，不要自己拼状态：计划进度、覆盖度、字段缺口、
 未决问题都在里面。看到"未覆盖 N（共 M）"时，N 是截断展示，M 才是总数。
+
+**再调 expose_graph**，它才是"下一步做什么"的依据：还有哪些路没走、哪条线索没用、哪条路卡住了。
+一条路 = (对象, 方法, 参数, 目的)，判据是**重跑能得到同一批结果**——
+"用 subfinder 被动枚举 a.com 的子域"是一条路，"扫过一次子域名"不是。
+expose_direction 领路拿到 id 后，expose_record / expose_artifact **必须**带 directionId，否则会被拒收；走完标 done（没收获也算走完），走不通标 dead 并写原因。
 
 ## 二、没有固定顺序
 这些层次互相喂线索，不是流水线 —— 顺序由你按当前证据决定。下面只是骨架，不是流程：

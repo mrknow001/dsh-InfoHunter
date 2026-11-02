@@ -28,6 +28,9 @@ import {
   DEFAULT_SENSITIVE_RULES, compileRules, fingerprintOf, normalizeArtifact, scanText,
 } from './artifacts.js'
 import { coverageOf } from './coverage.js'
+import {
+  DIRECTION_LIMIT, DIRECTION_STATES, clueKey, directionKey, findingKey, summarize,
+} from './graph.js'
 import { emptyPlan, normalizePlan } from './plan.js'
 import {
   CATEGORIES, PROTOCOL_FAMILIES, URLS_LIMIT, WEB_STATUS_FACETS, assetKey, asVerdict, matchQuery, mergeAsset,
@@ -45,7 +48,7 @@ function splitUrlHost(url) {
   return match === null ? '' : match[1].toLowerCase()
 }
 
-export const UNIT_VERSION = 6
+export const UNIT_VERSION = 7
 
 /** unit 与表名只允许这些字符（它们会进 SQL 标识符）。 */
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/
@@ -594,6 +597,11 @@ export class HunterStore {
   #tasks = new Map()
   /** @type {Map<string, object>} 物理 key `${sessionId}:${assetKey}:${sourceKind}` → 锚点 */
   #links = new Map()
+  /** @type {Map<string, object>} 物理 key `${sessionId}:${id}` → 探索图节点 */
+  #nodes = new Map()
+  /** @type {Map<string, object>} 物理 key `${sessionId}:${from}:${rel}:${to}` → 边 */
+  #edges = new Map()
+  #nodeSeq = 0
   #configRev = 0
   /** @type {Map<string, number>} sessionId → rev */
   #assetRevs = new Map()
@@ -674,6 +682,26 @@ export class HunterStore {
       const seeded = { enabled: true, rules: DEFAULT_SENSITIVE_RULES.map((rule) => ({ ...rule })) }
       this.#settings.set('sensitive', seeded)
       await this.unit.putRecord('settings', 'sensitive', seeded)
+    }
+    // 采集纪律：默认要求"没有探索方向就不许落库"；老会话可以在这里关掉。
+    if (!this.#settings.has('collection')) {
+      const seeded = { enforceDirection: true }
+      this.#settings.set('collection', seeded)
+      await this.unit.putRecord('settings', 'collection', seeded)
+    }
+    // 探索图：节点与边。
+    this.#nodes.clear()
+    this.#nodeSeq = 0
+    for (const [key, row] of Object.entries(tables.nodes ?? {})) {
+      if (row === null || typeof row !== 'object' || typeof row.sessionId !== 'string') continue
+      this.#nodes.set(key, row)
+      const seq = Number(row.seq) || 0
+      if (seq > this.#nodeSeq) this.#nodeSeq = seq
+    }
+    this.#edges.clear()
+    for (const [key, row] of Object.entries(tables.edges ?? {})) {
+      if (row === null || typeof row !== 'object') continue
+      this.#edges.set(key, row)
     }
     // 计划 / 派活 / 锚点。
     this.#plans.clear()
@@ -1258,6 +1286,288 @@ export class HunterStore {
    */
   coverage(sessionId) {
     return coverageOf(this.assetsOf(sessionId), this.linksOf(sessionId))
+  }
+
+  // ── 探索图：需求 / 线索 / 方向 / 发现 ──────────────────────────────────
+
+  /**
+   * 该会话的图节点（时间正序）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} [kind] - 只看某类节点。
+   * @returns {object[]}
+   */
+  nodesOf(sessionId, kind = '') {
+    const prefix = `${sessionId}:`
+    const out = []
+    for (const [physical, row] of this.#nodes) {
+      if (!physical.startsWith(prefix)) continue
+      if (kind !== '' && row.kind !== kind) continue
+      out.push(row)
+    }
+    return out.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+  }
+
+  /**
+   * 按 id 取节点。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} id - 节点 id。
+   * @returns {object | undefined}
+   */
+  nodeById(sessionId, id) {
+    return this.#nodes.get(`${sessionId}:${id}`)
+  }
+
+  /**
+   * 写回一个节点（内部用）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {object} node - 完整节点。
+   * @returns {Promise<object>}
+   */
+  async #persistNode(sessionId, node) {
+    const full = { ...node, sessionId }
+    await this.unit.putRecord('nodes', `${sessionId}:${node.id}`, full)
+    this.#nodes.set(`${sessionId}:${node.id}`, full)
+    this.#bump(sessionId)
+    return full
+  }
+
+  /**
+   * 加一个节点（按 key 去重）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {object} input - `{ kind, key, text, state?, priority?, payload? }`。
+   * @returns {Promise<{ node: object, duplicate: boolean }>}
+   */
+  async addNode(sessionId, input) {
+    const kind = String(input?.kind ?? '')
+    const key = String(input?.key ?? '')
+    if (key === '') throw new Error('节点缺少 key')
+    const existing = this.nodesOf(sessionId, kind).find((node) => node.key === key)
+    if (existing !== undefined) return { node: existing, duplicate: true }
+    this.#nodeSeq += 1
+    const id = `n${this.#nodeSeq}`
+    const now = Date.now()
+    const node = {
+      id,
+      seq: this.#nodeSeq,
+      kind,
+      key,
+      text: String(input?.text ?? '').slice(0, 500),
+      state: String(input?.state ?? 'open'),
+      priority: Number(input?.priority) || 0,
+      payload: input?.payload !== null && typeof input?.payload === 'object' ? input.payload : {},
+      createdAt: now,
+      updatedAt: now,
+      closedAt: 0,
+    }
+    await this.#persistNode(sessionId, node)
+    return { node, duplicate: false }
+  }
+
+  /**
+   * 加一条线索。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {object} input - `{ text, source, payload?, priority? }`。
+   * @returns {Promise<{ node: object, duplicate: boolean }>}
+   */
+  async addClue(sessionId, input) {
+    const text = String(input?.text ?? '').trim()
+    const source = String(input?.source ?? 'other').trim().toLowerCase()
+    const key = clueKey(source, text)
+    if (key === '') throw new Error('线索缺少正文')
+    return this.addNode(sessionId, {
+      kind: 'clue',
+      key,
+      text,
+      state: 'open',
+      priority: Number(input?.priority) || 0,
+      payload: { source, ...(input?.payload ?? {}) },
+    })
+  }
+
+  /**
+   * 加一条方向（路），已存在则复用。
+   *
+   * 重跑语义：已 done/dead 的路再次登记 → **改回 running**，不新建节点。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {object} input - `{ target, method, params, needId, clueId?, priority? }`。
+   * @returns {Promise<{ node: object, duplicate: boolean, restarted: boolean }>}
+   */
+  async addDirection(sessionId, input) {
+    const key = directionKey(input)
+    if (key === '') throw new Error('方向必须给 target 与 method')
+    const existing = this.nodesOf(sessionId, 'direction').find((node) => node.key === key)
+    if (existing !== undefined) {
+      const restarted = existing.state === 'done' || existing.state === 'dead'
+      const node = restarted
+        ? await this.#persistNode(sessionId, {
+            ...existing,
+            state: 'running',
+            payload: { ...existing.payload, claimedAt: Date.now() },
+            updatedAt: Date.now(),
+            closedAt: 0,
+          })
+        : existing
+      return { node, duplicate: true, restarted }
+    }
+    const total = this.nodesOf(sessionId, 'direction').length
+    if (total >= DIRECTION_LIMIT) {
+      throw new Error(`方向已达上限 ${DIRECTION_LIMIT} 条：先把走完的路结算（done/dead），不要一直新建`)
+    }
+    const now = Date.now()
+    const { node } = await this.addNode(sessionId, {
+      kind: 'direction',
+      key,
+      text: String(input?.text ?? `${input?.method} · ${input?.target}`).slice(0, 500),
+      state: 'running',
+      priority: Number(input?.priority) || 0,
+      payload: {
+        target: String(input?.target ?? ''),
+        method: String(input?.method ?? ''),
+        params: input?.params !== null && typeof input?.params === 'object' ? input.params : {},
+        needId: String(input?.needId ?? 'other'),
+        clueId: typeof input?.clueId === 'string' ? input.clueId : '',
+        claimedAt: now,
+      },
+    })
+    if (typeof input?.clueId === 'string' && input.clueId !== '') {
+      await this.linkNodes(sessionId, node.id, 'derived_from', input.clueId)
+    }
+    return { node, duplicate: false, restarted: false }
+  }
+
+  /**
+   * 结算一条方向。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} id - 方向节点 id。
+   * @param {string} state - `done` / `dead`。
+   * @param {string} [note] - 结果或失败原因。
+   * @returns {Promise<object | undefined>}
+   */
+  async closeDirection(sessionId, id, state, note = '') {
+    const node = this.nodeById(sessionId, id)
+    if (node === undefined || node.kind !== 'direction') return undefined
+    if (!DIRECTION_STATES.includes(state) || state === 'open' || state === 'running') {
+      throw new Error('结算只能是 done 或 dead')
+    }
+    if (state === 'dead' && String(note).trim() === '') throw new Error('标 dead 必须写原因')
+    return this.#persistNode(sessionId, {
+      ...node,
+      state,
+      payload: { ...node.payload, result: String(note).slice(0, 1000) },
+      updatedAt: Date.now(),
+      closedAt: Date.now(),
+    })
+  }
+
+  /**
+   * 领一条路：状态置为 running，并记录开始时间。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} id - 方向节点 id。
+   * @returns {Promise<object | undefined>}
+   */
+  async claimDirection(sessionId, id) {
+    const node = this.nodeById(sessionId, id)
+    if (node === undefined || node.kind !== 'direction') return undefined
+    return this.#persistNode(sessionId, {
+      ...node,
+      state: 'running',
+      payload: { ...node.payload, claimedAt: Date.now() },
+      updatedAt: Date.now(),
+    })
+  }
+
+  /**
+   * 把一条线索标死（确认无价值）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} id - 线索节点 id。
+   * @returns {Promise<object | undefined>}
+   */
+  async closeClue(sessionId, id) {
+    const node = this.nodeById(sessionId, id)
+    if (node === undefined || node.kind !== 'clue') return undefined
+    return this.#persistNode(sessionId, {
+      ...node,
+      state: 'dead',
+      updatedAt: Date.now(),
+      closedAt: Date.now(),
+    })
+  }
+
+  /**
+   * 加一条边（幂等）。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} fromId - 起点节点 id。
+   * @param {string} rel - 关系。
+   * @param {string} toId - 终点节点 id。
+   * @returns {Promise<void>}
+   */
+  async linkNodes(sessionId, fromId, rel, toId) {
+    if (fromId === '' || toId === '') return
+    const physical = `${sessionId}:${fromId}:${rel}:${toId}`
+    const row = { from: fromId, rel, to: toId, at: Date.now() }
+    await this.unit.putRecord('edges', physical, row)
+    this.#edges.set(physical, row)
+  }
+
+  /**
+   * 加一条发现，并挂到方向与资产上。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {object} input - `{ text, directionId, assetKeys? }`。
+   * @returns {Promise<{ node: object, duplicate: boolean }>}
+   */
+  async addFinding(sessionId, input) {
+    const text = String(input?.text ?? '').trim()
+    const key = findingKey(text)
+    if (key === '') throw new Error('发现缺少正文')
+    const { node, duplicate } = await this.addNode(sessionId, {
+      kind: 'finding',
+      key,
+      text,
+      state: 'confirmed',
+      payload: { assetKeys: Array.isArray(input?.assetKeys) ? input.assetKeys.slice(0, 50) : [] },
+    })
+    if (!duplicate && typeof input?.directionId === 'string' && input.directionId !== '') {
+      await this.linkNodes(sessionId, node.id, 'yields', input.directionId)
+    }
+    return { node, duplicate }
+  }
+
+  /**
+   * 某节点相关的边。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @param {string} id - 节点 id。
+   * @returns {object[]}
+   */
+  edgesOf(sessionId, id) {
+    const prefix = `${sessionId}:`
+    const out = []
+    for (const [physical, row] of this.#edges) {
+      if (!physical.startsWith(prefix)) continue
+      if (row.from === id || row.to === id) out.push(row)
+    }
+    return out
+  }
+
+  /**
+   * 图态势：计数 + 待探索 + 超时。
+   *
+   * @param {string} sessionId - 归属会话。
+   * @returns {object}
+   */
+  graphState(sessionId) {
+    return summarize(this.nodesOf(sessionId))
   }
 
   /**

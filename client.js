@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
      * 所以它不会静默漂移。它的用处是识别"页面是旧的"：改完 `client.js` 后没刷新页面时，
      * 宿主报的是新版本、界面还是旧代码，这时面板会显示两者不一致并提示刷新。
      */
-    const CLIENT_VERSION = '0.16.0'
+    const CLIENT_VERSION = '0.17.0'
 
     /** 用途 id —— 与宿主 `vocabulary.js` 的 PURPOSES 同序同值。 */
     const PURPOSES = [

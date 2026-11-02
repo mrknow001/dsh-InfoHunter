@@ -73,7 +73,7 @@ export const inject = ['storage']
 const ROUTE_PREFIX = '/infohunter'
 
 /** 面板读写的表名（unit 内）。 */
-const TABLES = ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links']
+const TABLES = ['config', 'results', 'assets', 'queries', 'questions', 'artifacts', 'settings', 'plans', 'tasks', 'links', 'nodes', 'edges']
 
 /** 单个请求体的上限，防止误传巨大 JSON。 */
 const MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -327,6 +327,17 @@ function createApiHandler(getStore) {
       }
       if (endpoint === '/queries/clear' && method === 'POST') {
         return sendJson(res, 200, { queries: await store.clearQueries() })
+      }
+
+      // ── 探索图（按会话）──────────────────────────────────────────────
+      if (endpoint === '/graph' && method === 'GET') {
+        if (sessionId === '') return sendJson(res, 400, { error: { code: 'missing-session', message: 'sessionId 必填' } })
+        const kind = url.searchParams.get('kind') ?? ''
+        return sendJson(res, 200, {
+          nodes: store.nodesOf(sessionId, kind),
+          state: store.graphState(sessionId),
+          rev: store.rev(sessionId),
+        })
       }
 
       // ── 信息产物（按会话）─────────────────────────────────────────────
