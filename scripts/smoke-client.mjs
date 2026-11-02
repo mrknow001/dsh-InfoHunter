@@ -93,6 +93,18 @@ const pure = plugin.__test
 check(pure !== undefined && typeof pure.cardModel === 'function', '__test 提供了 cardModel')
 check(typeof pure.detailModel === 'function', '__test 提供了 detailModel')
 check(pure.BUILTIN_QUERIES !== undefined && Array.isArray(pure.BUILTIN_QUERIES.endpoint) && Array.isArray(pure.BUILTIN_QUERIES.app), '__test 提供了两套内置语句表')
+// 探索图：按线索分组（抽屉的渲染依据）
+const graphNodes = [
+  { id: 'n1', kind: 'clue', text: 'a.com', payload: { source: 'domain' } },
+  { id: 'n2', kind: 'direction', state: 'done', payload: { clueId: 'n1', method: 'subfinder', target: 'a.com' } },
+  { id: 'n3', kind: 'direction', state: 'open', payload: { clueId: 'n1', method: 'httpx', target: 'a.com' } },
+  { id: 'n4', kind: 'direction', state: 'running', payload: { method: 'naabu', target: '1.2.3.4' } },
+]
+const grouped = pure.groupByClue(graphNodes)
+check(grouped.groups.length === 1 && grouped.groups[0].roads.length === 2, '探索图：路按线索归组',
+  JSON.stringify(grouped.groups.map((item) => item.roads.length)))
+check(grouped.orphans.length === 1 && grouped.orphans[0].id === 'n4', '探索图：没有线索来源的路进 orphans')
+check(pure.groupByClue([]).groups.length === 0, '探索图：空数据不炸')
 
 if (pure !== undefined) {
   const web = pure.cardModel({

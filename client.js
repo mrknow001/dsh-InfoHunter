@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
      * 所以它不会静默漂移。它的用处是识别"页面是旧的"：改完 `client.js` 后没刷新页面时，
      * 宿主报的是新版本、界面还是旧代码，这时面板会显示两者不一致并提示刷新。
      */
-    const CLIENT_VERSION = '0.17.0'
+    const CLIENT_VERSION = '0.18.0'
 
     /** 用途 id —— 与宿主 `vocabulary.js` 的 PURPOSES 同序同值。 */
     const PURPOSES = [
@@ -296,6 +296,20 @@ window.__ModuleLoader__.load({
       'questions.keep': '保持分开',
       'questions.dismiss': '先不管',
       'questions.more': '还有 {n} 条没显示',
+      'graph.title': '探索图',
+      'graph.openHint': '线索 → 路 → 发现：看还有哪些路没走、哪条卡住了',
+      'graph.close': '关闭',
+      'graph.clues': '线索',
+      'graph.unused': '未用',
+      'graph.frontier': '待走',
+      'graph.orphan': '未关联线索的路',
+      'graph.noRoads': '这条线索还没有派生出路',
+      'graph.empty': '还没有线索。查到什么就先 expose_clue 登记，再派生路。',
+      'graph.overdue': '超时未回',
+      'graph.state.open': '待走',
+      'graph.state.running': '进行中',
+      'graph.state.done': '已走',
+      'graph.state.dead': '走不通',
       'plan.stages': '阶段',
       'plan.current': '当前',
       'plan.allDone': '全部完成',
@@ -657,6 +671,20 @@ window.__ModuleLoader__.load({
       'questions.keep': 'Keep separate',
       'questions.dismiss': 'Later',
       'questions.more': '{n} more not shown',
+      'graph.title': 'Exploration map',
+      'graph.openHint': 'Clues → roads → findings: what is unvisited, what is stuck',
+      'graph.close': 'Close',
+      'graph.clues': 'Clues',
+      'graph.unused': 'unused',
+      'graph.frontier': 'open',
+      'graph.orphan': 'Roads without a clue',
+      'graph.noRoads': 'No road derived from this clue yet',
+      'graph.empty': 'No clues yet. Record what you find with expose_clue, then derive roads.',
+      'graph.overdue': 'Overdue',
+      'graph.state.open': 'open',
+      'graph.state.running': 'running',
+      'graph.state.done': 'done',
+      'graph.state.dead': 'dead',
       'plan.stages': 'Stages',
       'plan.current': 'now',
       'plan.allDone': 'all done',
@@ -2228,7 +2256,97 @@ window.__ModuleLoader__.load({
     }
 
 
-    function AssetsArea(props) {
+    /**
+ * 按线索把路分组（抽屉与测试共用）。
+ *
+ * @param nodes - /graph 返回的节点数组。
+ * @returns { groups: [{ clue, roads }], orphans }
+ */
+function groupByClue(nodes) {
+  const list = Array.isArray(nodes) ? nodes : []
+  const clues = list.filter((node) => node.kind === 'clue')
+  const byClue = new Map()
+  for (const node of list.filter((item) => item.kind === 'direction')) {
+    const clueId = typeof node.payload?.clueId === 'string' ? node.payload.clueId : ''
+    if (!byClue.has(clueId)) byClue.set(clueId, [])
+    byClue.get(clueId).push(node)
+  }
+  return {
+    groups: clues
+      .map((clue) => ({ clue, roads: byClue.get(clue.id) ?? [] }))
+      .sort((a, b) => b.roads.length - a.roads.length),
+    orphans: byClue.get('') ?? [],
+  }
+}
+
+/**
+ * 探索图抽屉：需求 → 线索 → 路 → 发现。
+ *
+ * 每条路显示 **对象 · 方法 · 范围**，而不是只显示工具名 —— 否则图会退化成"这个工具用过没"。
+ * 数据来自 /graph：nodes 里 direction.payload.clueId 就是分组依据，不需要额外拉边。
+ */
+function GraphDrawer(props) {
+  const { t, graph, open, onClose } = props
+  if (open !== true) return null
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : []
+  const summary = graph?.state ?? {}
+  const { groups, orphans } = groupByClue(nodes)
+  const toneOf = (state) => state === 'done' ? T.success : state === 'dead' ? T.error : state === 'running' ? T.warn : T.text3
+  const labelOf = (state) => t(`graph.state.${state}`)
+  const paramsText = (node) => {
+    const params = node.payload?.params ?? {}
+    const text = JSON.stringify(params)
+    return text === '{}' ? '' : (text.length > 64 ? `${text.slice(0, 64)}…` : text)
+  }
+  const dirLine = (node) => h('div', { key: node.id, className: 'ih-graph-dir' },
+    h('span', { className: 'ih-graph-dot', style: { background: toneOf(node.state) } }),
+    h('span', { className: 'ih-graph-method' }, node.payload?.method ?? ''),
+    h('span', { className: 'ih-graph-target' }, node.payload?.target ?? ''),
+    h('span', { className: 'ih-graph-params' }, paramsText(node)),
+    h('span', { className: 'ih-graph-state', style: { color: toneOf(node.state) } }, labelOf(node.state)),
+    node.payload?.result ? h('span', { className: 'ih-graph-result' }, String(node.payload.result).slice(0, 80)) : null,
+  )
+  const group = (clue, list) => h('div', { key: clue === undefined ? 'orphan' : clue.id, className: 'ih-graph-group' },
+    h('div', { className: 'ih-graph-clue' },
+      h('span', { style: { color: T.text2 } }, clue === undefined ? t('graph.orphan') : clue.text),
+      clue === undefined ? null : h('span', { className: 'ih-graph-src' }, clue.payload?.source ?? ''),
+      h('span', { className: 'ih-graph-count' }, String(list.length)),
+    ),
+    list.length === 0 ? h('div', { className: 'ih-graph-empty' }, t('graph.noRoads')) : list.map(dirLine),
+  )
+
+  return h('div', { className: 'ih-graph-mask', onClick: onClose },
+    h('aside', {
+      className: 'ih-graph-panel',
+      onClick: (event) => event.stopPropagation(),
+    },
+      h('div', { className: 'ih-graph-head' },
+        h('span', { className: 'ih-graph-title' }, t('graph.title')),
+        h('button', { type: 'button', className: 'ih-graph-close', onClick: onClose }, t('graph.close')),
+      ),
+      h('div', { className: 'ih-graph-sum' },
+        h('span', null, `${t('graph.clues')} ${summary.clues ?? 0}（${t('graph.unused')} ${summary.cluesUnused ?? 0}）`),
+        h('span', { style: { color: T.warn } }, `${t('graph.state.running')} ${summary.running ?? 0}`),
+        h('span', { style: { color: T.text2 } }, `${t('graph.state.open')} ${summary.open ?? 0}`),
+        h('span', { style: { color: T.success } }, `${t('graph.state.done')} ${summary.done ?? 0}`),
+        h('span', { style: { color: T.error } }, `${t('graph.state.dead')} ${summary.dead ?? 0}`),
+      ),
+      summary.overdue !== undefined && summary.overdue.length > 0
+        ? h('div', { className: 'ih-graph-overdue' },
+            `${t('graph.overdue')} ${summary.overdue.length}：`,
+            summary.overdue.map((node) => `${node.payload?.method} · ${node.payload?.target}`).join('；'))
+        : null,
+      groups.length === 0 && orphans.length === 0
+        ? h('div', { className: 'ih-graph-empty' }, t('graph.empty'))
+        : [
+            groups.map((item) => group(item.clue, item.roads)),
+            orphans.length === 0 ? null : group(undefined, orphans),
+          ],
+    ),
+  )
+}
+
+function AssetsArea(props) {
       const { t, sessionId } = props
       const active = props.active !== false
       const [state, setState] = useState({
@@ -2592,6 +2710,7 @@ window.__ModuleLoader__.load({
           onClear: () => void clearRecent(),
           onHelp: () => setHelpOpen(true),
         }),
+        h(GraphDrawer, { t, graph, open: graphOpen, onClose: () => setGraphOpen(false) }),
         helpOpen ? h(SearchHelp, {
           t,
           view,
@@ -3468,6 +3587,34 @@ window.__ModuleLoader__.load({
           '.ih-panel .ih-status-fill{display:block;height:100%;border-radius:2px}',
           '.ih-panel .ih-status-value{font-family:' + T.code + ';color:' + T.text2 + ';white-space:nowrap}',
           '@media (max-width:900px){.ih-panel .ih-status-label{display:none}}',
+          // ── 探索图 ─────────────────────────────────────────────────────
+          '.ih-panel .ih-graphbtn{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;'
+            + 'cursor:pointer;font:inherit;font-size:11.5px;padding:3px 10px;border-radius:7px;'
+            + 'background:transparent;color:' + T.text2 + ';border:1px dashed ' + T.border + '}',
+          '.ih-panel .ih-graph-mask{position:fixed;inset:0;background:' + tint(T.text, 0.18) + ';z-index:60}',
+          '.ih-panel .ih-graph-panel{position:fixed;top:0;right:0;bottom:0;width:430px;max-width:94vw;'
+            + 'background:' + T.card + ';border-left:1px solid ' + T.border + ';overflow:auto;padding:14px 16px;'
+            + 'box-shadow:-12px 0 32px ' + tint(T.text, 0.16) + '}',
+          '.ih-panel .ih-graph-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}',
+          '.ih-panel .ih-graph-title{font-size:13px;font-weight:700;color:' + T.text + '}',
+          '.ih-panel .ih-graph-close{cursor:pointer;font:inherit;font-size:11.5px;padding:2px 9px;border-radius:6px;'
+            + 'background:transparent;color:' + T.text2 + ';border:1px solid ' + T.border + '}',
+          '.ih-panel .ih-graph-sum{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:' + T.text3 + ';margin-bottom:8px}',
+          '.ih-panel .ih-graph-overdue{font-size:11px;color:' + T.error + ';margin-bottom:10px;line-height:1.6}',
+          '.ih-panel .ih-graph-group{border-top:1px solid ' + T.border + ';padding:9px 0}',
+          '.ih-panel .ih-graph-clue{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;margin-bottom:6px}',
+          '.ih-panel .ih-graph-src{font-size:10px;color:' + T.text3 + ';border:1px solid ' + T.border + ';'
+            + 'border-radius:999px;padding:0 6px}',
+          '.ih-panel .ih-graph-count{font-size:10.5px;color:' + T.text3 + ';margin-left:auto;font-family:' + T.code + '}',
+          '.ih-panel .ih-graph-dir{display:flex;align-items:baseline;gap:7px;font-size:11.5px;padding:3px 0 3px 2px;'
+            + 'line-height:1.5;flex-wrap:wrap}',
+          '.ih-panel .ih-graph-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;transform:translateY(-1px)}',
+          '.ih-panel .ih-graph-method{font-family:' + T.code + ';color:' + T.text + '}',
+          '.ih-panel .ih-graph-target{color:' + T.text2 + ';min-width:0;word-break:break-all}',
+          '.ih-panel .ih-graph-params{font-family:' + T.code + ';font-size:10px;color:' + T.text3 + '}',
+          '.ih-panel .ih-graph-state{margin-left:auto;font-size:10.5px}',
+          '.ih-panel .ih-graph-result{flex-basis:100%;font-size:10.5px;color:' + T.text3 + ';padding-left:13px}',
+          '.ih-panel .ih-graph-empty{font-size:11.5px;color:' + T.text3 + ';padding:10px 0}',
           // 右侧语句栏：卡片滚动时不动。
           '.ih-panel .ih-rail{position:sticky;top:8px;display:flex;flex-direction:column;gap:10px;min-width:0;'
             + 'border:1px solid ' + T.border + ';border-radius:' + T.radius + 'px;padding:9px 10px;background:' + T.card + '}',
@@ -3603,7 +3750,7 @@ window.__ModuleLoader__.load({
        * 卡片与详情"有数据/没数据"的判断必须能被断言 —— 否则"未采集"很容易在改动中
        * 退化成留白，而那正是用户看不出"到底采没采到"的原因。
        */
-      __test: { cardModel, detailModel, BUILTIN_QUERIES },
+      __test: { cardModel, detailModel, BUILTIN_QUERIES, groupByClue },
 
       /**
        * @param {object} ctx - 浏览器半的 Cordis 上下文。

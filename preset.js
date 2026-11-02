@@ -1099,6 +1099,7 @@ function registerTools(ctx, store) {
         target: { type: 'string', description: 'start 用：目标（host / IP / 域名）。' },
         layer: { type: 'string', description: 'start 用：证据层或阶段 id（dns / ports / web / systems / artifacts…）。' },
         tool: { type: 'string', description: 'start 用：用哪个工具/平台。' },
+        directionId: { type: 'string', description: 'start 用：这次派活属于哪条路（expose_direction 的 id）。' },
         id: { type: 'string', description: 'finish 用：任务 id。' },
         state: { type: 'string', enum: ['done', 'failed', 'skipped'], description: 'finish 用：结果状态。' },
         result: { type: 'string', description: 'finish 用：结果摘要（几条资产/产物）。' },
@@ -1123,6 +1124,7 @@ function registerTools(ctx, store) {
         target: args?.target,
         layer: args?.layer,
         tool: args?.tool,
+        directionId: args?.directionId,
       })
       return {
         text: duplicate
@@ -2241,7 +2243,27 @@ content 里的敏感串会按面板配置的正则自动打标，不用自己评
 收尾**必须**先调 expose_question_list：
 - 有问题 → 用 ask_user_question 一次性问清（每个问题就是"这两个入口是不是同一个系统"），
   再用 expose_question_resolve 写回；用户说先不管就 dismiss。
-- 没有问题 → 直接汇总，不要编造待确认项。`
+- 没有问题 → 直接汇总，不要编造待确认项。
+
+## 十、派活：主代理只调度，子代理只干活
+
+一条路要么自己做，要么派给子代理。**大输出、可独立、可结构化**的活优先派出去：
+端口扫描、子域枚举、目录爆破、批量指纹、批量截图、批量验活。
+
+主代理负责**调度与落库**，不要自己读一堆工具原始输出：
+1. expose_graph 选路 → expose_direction claim，拿到 directionId 与上下文；
+2. 用 subagent 派活，任务说明必须**自包含**（子代理看不到这个对话）：
+   目标（线索一句话 + target）、允许的工具（1–3 个，写清用法）、禁止事项（速率、不碰的域）、
+   返回 JSON 的形状；
+3. 拿回结果 → 校验 → expose_record / expose_artifact（带 directionId）；
+4. 新线索用 expose_clue 登记；方向结算 done / dead（dead 必须写原因）；expose_task 记一笔。
+
+让子代理照这个形状返回：
+{ ok, findings: [{ kind, host, port, ip, protocol, status, title, tech, service, version, headers, body }],
+  clues: [{ text, source }], negative: [{ what, why }], errors: [] }
+
+不要派：需要全局判断的活（系统归属、内容页取舍、计划推进），这些必须主代理做。
+同一 target 的"端口 → 服务 → Web → 指纹"是依赖链，串行；不同 target 可并行，并发 3–5。`
 
 /**
  * 激活 preset 半。

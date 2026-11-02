@@ -1207,7 +1207,10 @@ export class HunterStore {
     if (existing !== undefined) return { task: existing, duplicate: true }
     const id = `task-${Date.now().toString(36)}-${(this.#tasks.size + 1).toString(36)}`
     const task = {
-      id, sessionId, target, layer, tool, state: 'running', owner: '',
+      id, sessionId, target, layer, tool,
+      // 派活必须挂在一条路上：图里才看得出"这次是谁在跑哪条路"。
+      directionId: typeof input?.directionId === 'string' ? input.directionId : '',
+      state: 'running', owner: '',
       result: null, error: '', startedAt: Date.now(), endedAt: 0,
     }
     await this.unit.putRecord('tasks', `${sessionId}:${id}`, task)
