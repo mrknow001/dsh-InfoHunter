@@ -1,6 +1,6 @@
 {
   "name": "@infohunter/dsh-information-hunter",
-  "version": "0.18.1",
+  "version": "0.19.0",
   "private": true,
   "type": "module",
   "description": "互联网暴露面收集：暴露面收集 agent 预设 + 会话面板 + SQLite 持久化的工具/空间测绘/技能/MCP 配置。",

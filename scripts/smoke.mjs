@@ -1517,6 +1517,52 @@ try {
     stubStore.pageAssets = realPage
   }
 
+  // Planner 模式：claim 渲染子代理任务书（含工具挑选）
+  {
+    const dirTool = presetFake.tools.find((tool) => tool.name === 'expose_direction')
+    // 配置一个 subfinder，claim 一条 subfinder 的路，回执应带任务书
+    stubStore.nodeById = (_sid, id) => (id === 'n-brief'
+      ? {
+          id: 'n-brief',
+          kind: 'direction',
+          state: 'open',
+          payload: { method: 'subfinder', target: 'a.com', params: {}, needId: 'web', clueId: '' },
+        }
+      : undefined)
+    const graphBackup = { edgesOf: stubStore.edgesOf, claimDirection: stubStore.claimDirection }
+    stubStore.edgesOf = () => []
+    stubStore.claimDirection = async () => undefined
+    const claimOut = await dirTool.execute({ action: 'claim', id: 'n-brief' }, { agent: { id: 's1' } })
+    stubStore.edgesOf = graphBackup.edgesOf
+    stubStore.claimDirection = graphBackup.claimDirection
+    check(typeof claimOut.brief === 'string' && claimOut.brief.includes('子代理任务书'), 'claim 回执带子代理任务书')
+    check(claimOut.brief.includes('只做这一条、只产生事实、做完即停'), '任务书含唯一任务硬约束（ARTEX 式）')
+    check(claimOut.brief.includes('directionId: n-brief'), '任务书带 directionId')
+    check(claimOut.brief.includes('返回 JSON'), '任务书含返回形状')
+  }
+
+  // expose_config 列出停用行
+  {
+    const configTool2 = presetFake.tools.find((tool) => tool.name === 'expose_config')
+    const realCfg = stubStore.config
+    const realEnabled = stubStore.enabledEntries
+    try {
+      stubStore.config = () => ({
+        entries: [
+          { id: 't1', type: 'tool', name: 'subfinder', enabled: true, purpose: 'subdomain', path: 'x', inputs: [], outputs: [] },
+          { id: 'm1', type: 'mcp', name: '我的MCP', enabled: false, transport: 'stdio', command: 'node', args: ['s.js'] },
+        ],
+      })
+      stubStore.enabledEntries = (type) => stubStore.config().entries.filter((entry) => entry.enabled && (type === undefined || entry.type === type))
+      const cfgOut = await configTool2.execute({}, { agent: { id: 's1' } })
+      check(cfgOut.text.includes('已停用'), 'expose_config 提示存在停用行')
+      check(cfgOut.text.includes('我的MCP'), '停用的 MCP 行被点名')
+    } finally {
+      stubStore.config = realCfg
+      stubStore.enabledEntries = realEnabled
+    }
+  }
+
   // 探索图硬闸：没有方向不许落库；方向有效才放行。
   const gateBackup = {
     settings: stubStore.settings,

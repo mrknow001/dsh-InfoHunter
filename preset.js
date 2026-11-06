@@ -193,6 +193,97 @@ function coversKind(entry, kind) {
   return entry.purpose === kind
 }
 
+// ── 子代理任务书（claim 时由代码渲染）──────────────────────────────────────
+//
+// 主会话是 Planner：它不亲自跑工具。claim 一条路时，这里直接渲染出一份**可以原样塞进
+// subagent 提示词**的任务书 —— 目标、允许的工具（按这条路的输入形态从配置里自动选）、
+// 禁止事项、返回 JSON 形状。主会话拼不出也拼不好这份东西，交给代码。
+// 参照 ARTEX renderIntentTask：「你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）」。
+
+/** 每条路按 method 预期能吃到/产出的形态（用于从配置挑工具）。 */
+const METHOD_SHAPES = {
+  subfinder: { inputs: ['main_domain', 'domain'], outputs: ['subdomain'] },
+  ksubdomain: { inputs: ['domain', 'subdomain'], outputs: ['subdomain'] },
+  httpx: { inputs: ['domain', 'subdomain', 'endpoint', 'url'], outputs: ['status', 'title', 'tech', 'cert'] },
+  naabu: { inputs: ['ip', 'cidr', 'domain', 'subdomain'], outputs: ['port', 'endpoint'] },
+  ffuf: { inputs: ['url', 'endpoint'], outputs: ['url', 'status'] },
+  hostcollision: { inputs: ['subdomain', 'ip', 'cidr', 'domain'], outputs: ['endpoint', 'url', 'status'] },
+  bing: { inputs: ['domain', 'main_domain'], outputs: ['url', 'title'] },
+  asn: { inputs: ['ip', 'domain'], outputs: ['cidr'] },
+  ct: { inputs: ['domain', 'main_domain'], outputs: ['subdomain', 'cert'] },
+  verify: { inputs: ['endpoint'], outputs: ['status', 'title', 'cert'] },
+  enrich: { inputs: ['domain', 'subdomain', 'endpoint'], outputs: ['ip', 'cname', 'cert', 'status'] },
+}
+
+/**
+ * 为一条路挑允许的工具：先看配置里有没有同名工具行；没有再按形态匹配（输入命中 + 输出命中）。
+ * 只挑 1–3 个 —— 子代理拿太多工具会自己加戏。
+ *
+ * @param {object} store - 会话存储。
+ * @param {string} method - 路的 method。
+ * @returns {{ tools: object[], note: string }}
+ */
+function pickToolsFor(store, method) {
+  const rows = store.enabledEntries('tool')
+  const shapes = METHOD_SHAPES[String(method ?? '').toLowerCase()]
+  if (shapes === undefined) return { tools: rows.slice(0, 3), note: '未声明该方法的形态，取前 3 个工具' }
+  // ① 同名优先（method 就是用这个工具）
+  const named = rows.filter((row) => String(row.id ?? '').toLowerCase() === String(method).toLowerCase()
+    || String(row.name ?? '').trim().toLowerCase() === String(method).toLowerCase())
+  const matched = named.length > 0 ? named : rows.filter((row) => {
+    const inputs = Array.isArray(row.inputs) ? row.inputs : []
+    const outputs = Array.isArray(row.outputs) ? row.outputs : []
+    return inputs.some((id) => shapes.inputs.includes(id)) && outputs.some((id) => shapes.outputs.includes(id))
+  })
+  return { tools: matched.slice(0, 3), note: named.length > 0 ? '按方法名选中' : '按输入/输出形态匹配' }
+}
+
+/**
+ * 渲染子代理任务书（claim 的回执主体）。
+ *
+ * @param {object} node - 方向节点。
+ * @param {object | undefined} clue - 来源线索。
+ * @param {object} store - 会话存储。
+ * @returns {string}
+ */
+function renderSubagentBrief(node, clue, store) {
+  const payload = node.payload ?? {}
+  const { tools } = pickToolsFor(store, payload.method)
+  const toolLines = tools.length === 0
+    ? '  （配置里没有匹配的工具 —— 用内置 expose_enrich / expose_verify 兜底，或问用户补配置）'
+    : tools.map((row) => {
+        const usage = String(row.description ?? '').trim() === '' ? '' : `\n  用法：${String(row.description).trim().slice(0, 600)}`
+        return `  - ${String(row.name ?? row.id)}（${String(row.path ?? '')}）${usage}`
+      }).join('\n')
+  return [
+    '【子代理任务书 —— 原样复制进 subagent 的提示词】',
+    '',
+    `目标：${clue === undefined ? '' : `${clue.text}（来源线索）`}`,
+    `  target: ${payload.target ?? ''}`,
+    `  方法: ${payload.method ?? ''}    参数: ${JSON.stringify(payload.params ?? {})}`,
+    `  需求: ${payload.needId ?? 'other'}`,
+    '',
+    '允许的工具（只用这些，不要自己找别的）：',
+    toolLines,
+    '',
+    '禁止：',
+    '  - 不提交表单、不登录、不爆破路径（除非任务书明确要求）',
+    '  - 不读/不写面板（expose_* 是主会话的活，你只返回结果）',
+    '  - 单工具调用超时或报错 2 次就放弃该项，写进 errors，不要死磕',
+    '',
+    '返回 JSON（只回这个，不要解释）：',
+    '  { ok: boolean,',
+    '    findings: [{ kind, host, port, ip, protocol, status, title, tech, service, version, headers, body }],',
+    '    clues: [{ text, source }],',
+    '    negative: [{ what, why }],',
+    '    errors: [] }',
+    '',
+    `directionId: ${node.id}（主会话落库时用，你不要用它）`,
+    '',
+    '【本次唯一任务：只做这一条、只产生事实、做完即停。不扩展目标、不顺手多查。】',
+  ].join('\n')
+}
+
 // ── 受控执行 ────────────────────────────────────────────────────────────────
 //
 // 预设里**没有任何 shell、文件系统、任意 HTTP 工具**。所有动作都必须穿过下面这个
@@ -499,6 +590,11 @@ function registerTools(ctx, store) {
         .filter((entry) => wantPurpose === undefined || coversKind(entry, wantPurpose))
         .filter((entry) => wantNeeds === undefined || coversInputs(entry, wantNeeds))
         .filter((entry) => wantProduces === undefined || coversOutputs(entry, wantProduces))
+      // 停用行不算能力，但模型必须知道它们存在 —— 否则用户关着的 MCP/工具会被当成
+      // "从来没有过"，模型既不提也不问，用户以为配了就能用。真机上发生过：用户配了
+      // MCP 但关着，模型第一句"配置已明确"里完全不提，用户以为出 bug 了。
+      const disabled = store.config().entries.filter((entry) => entry.enabled === false
+        && (wantType === undefined || entry.type === wantType))
       if (entries.length === 0) {
         // 区分"整份配置为空"和"筛选没命中"：混为一谈会让模型误判成用户什么都没配。
         const filters = [
@@ -526,7 +622,16 @@ function registerTools(ctx, store) {
         + '\n串接规则：一行的输出命中另一行的输入，后者就是前者的下游（空间测绘的输出看它的「能出」）。'
       const body = shown.map(formatEntry).join('\n\n')
       const tail = entries.length > shown.length ? `\n\n…还有 ${entries.length - shown.length} 条未列出（按 need 收窄 type/purpose 再看）。` : ''
-      return { text: clamp(`${head}${legend}\n\n${body}${tail}`), count: entries.length }
+      const disabledBlock = disabled.length === 0 ? '' : `\n\n**已停用（不算可用能力，但它们存在）**：\n${
+        disabled.slice(0, 20).map((entry) => {
+          const label = ENTRY_TYPE_LABELS[entry.type] ?? entry.type
+          const detail = entry.type === 'mcp'
+            ? `连接 ${String(entry.url ?? '') || [String(entry.command ?? ''), ...(Array.isArray(entry.args) ? entry.args : [])].join(' ')}`
+            : String(entry.path ?? '') || String(entry.skillName ?? '')
+          return `- [${label}] ${String(entry.name ?? '') || entry.id}${detail === '' ? '' : ` — ${detail}`}`
+        }).join('\n')
+      }${disabled.length > 20 ? `\n…还有 ${disabled.length - 20} 条` : ''}\n要用哪个请让用户在面板里启用，不要假装它是可用能力。`
+      return { text: clamp(`${head}${legend}\n\n${body}${tail}${disabledBlock}`), count: entries.length }
     },
   })
 
@@ -1368,16 +1473,19 @@ function registerTools(ctx, store) {
           .map((edge) => store.nodeById(sessionId, edge.from))
           .find((item) => item !== undefined)
         if (node.state !== 'running') await store.claimDirection(sessionId, node.id)
+        const brief = renderSubagentBrief(node, clue, store)
         return {
           text: [
-            `已领路 ${node.id}：${node.payload?.method} · ${node.payload?.target}`,
-            `参数：${JSON.stringify(node.payload?.params ?? {})}`,
-            `需求：${node.payload?.needId ?? 'other'}`,
-            clue === undefined ? '来源线索：无' : `来源线索：${clue.text}`,
-            '接下来：调用工具 → expose_record / expose_artifact 必须带这个 directionId → 最后 done/dead。',
+            `已领路 ${node.id}：${node.payload?.method} · ${node.payload?.target}（状态 running）`,
+            '',
+            brief,
+            '',
+            '主会话接下来：把上面的任务书派给 subagent → 拿回 JSON → 校验 → expose_record/expose_artifact（带 directionId）'
+            + '→ 新线索 expose_clue → done/dead。**不要自己跑工具**。',
           ].join('\n'),
           id: node.id,
           payload: node.payload,
+          brief,
         }
       }
       if (action === 'done' || action === 'dead') {
@@ -2245,25 +2353,28 @@ content 里的敏感串会按面板配置的正则自动打标，不用自己评
   再用 expose_question_resolve 写回；用户说先不管就 dismiss。
 - 没有问题 → 直接汇总，不要编造待确认项。
 
-## 十、派活：主代理只调度，子代理只干活
+## 十、分工：你是规划者，不是执行者
 
-一条路要么自己做，要么派给子代理。**大输出、可独立、可结构化**的活优先派出去：
-端口扫描、子域枚举、目录爆破、批量指纹、批量截图、批量验活。
+**你（主会话）是 Planner。你的合法产物只有五种：读态势、登记线索/路、派 subagent、
+把 subagent 的结果落库、结算路。绝不在本轮亲自跑工具、不读工具原始输出。**
 
-主代理负责**调度与落库**，不要自己读一堆工具原始输出：
-1. expose_graph 选路 → expose_direction claim，拿到 directionId 与上下文；
-2. 用 subagent 派活，任务说明必须**自包含**（子代理看不到这个对话）：
-   目标（线索一句话 + target）、允许的工具（1–3 个，写清用法）、禁止事项（速率、不碰的域）、
-   返回 JSON 的形状；
-3. 拿回结果 → 校验 → expose_record / expose_artifact（带 directionId）；
-4. 新线索用 expose_clue 登记；方向结算 done / dead（dead 必须写原因）；expose_task 记一笔。
+一轮的标准动作：
+1. expose_state + expose_graph → 选一条优先级最高的 open 路；
+2. expose_direction claim → 回执里有**代码渲染好的子代理任务书**（目标/允许的工具/禁止/返回形状）；
+3. 把任务书**原样**派给 subagent（subagent 看不到这个对话，任务书就是它的全部世界）；
+4. 拿回 JSON → 校验（ok? errors? findings 有没有缺端口）→ expose_record / expose_artifact（带 directionId）；
+5. 新线索 expose_clue；方向结算 done（没收获也算走完）/ dead（必须写原因）；expose_task 记一笔。
 
-让子代理照这个形状返回：
-{ ok, findings: [{ kind, host, port, ip, protocol, status, title, tech, service, version, headers, body }],
-  clues: [{ text, source }], negative: [{ what, why }], errors: [] }
+**硬底线（防停摆）**：目标未达成且 frontier 为空、也没有 running 的路 → 本轮必须 add
+至少一条新路；产出 0 条 = 任务停摆，等于偷懒。
+**串行链分步派**："端口 → 服务 → Web → 指纹"这类依赖链，本轮只派前置已满足的那步，
+其余等图更新后再派；不同 target 才能并行，并发 3–5。
+**例外（仅开局）**：图几乎为空、无法把初始路说具体时，允许 ≤3 次只读探测
+（expose_enrich 探一下首页/解析），**唯一合法产物是一句更精准的路描述** ——
+一旦发现自己在枚举端点/逐个试目标，立刻停手写成路派出去。
 
-不要派：需要全局判断的活（系统归属、内容页取舍、计划推进），这些必须主代理做。
-同一 target 的"端口 → 服务 → Web → 指纹"是依赖链，串行；不同 target 可并行，并发 3–5。`
+不要派给 subagent 的：系统归属判定、内容页取舍、计划推进、收尾汇总 —— 这些是 Planner 的活。
+subagent 返回的 negative（试过不行）同样要落库：它防止下次重复派同一条死路。`
 
 /**
  * 激活 preset 半。
